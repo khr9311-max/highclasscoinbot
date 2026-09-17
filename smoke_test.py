@@ -8,10 +8,12 @@
 """
 
 import asyncio
+import json
 import os
 import shutil
 import sys
 import tempfile
+import time
 
 # 실주문 방지. Config 임포트 전에 반드시 설정해야 한다.
 os.environ["DRY_RUN"] = "true"
@@ -134,6 +136,16 @@ def test_circuit_breaker():
     sustained = cb.evaluate(0.1, 0.5, shred, "KRW-BTC")
     check("단절 지속 시 발동", sustained.triggered, sustained.describe())
 
+    # 발동 직후에도 카운터가 0 으로 리셋돼야 한다. 리셋이 없으면 단절이
+    # 지속되는 동안 매 틱 재발동 판정이 서서, main.py 쿨다운이 풀릴 때마다
+    # 같은 사건으로 알림이 반복된다(새벽 42회 연속 발동의 직접 원인).
+    again = cb.evaluate(0.1, 0.5, shred, "KRW-BTC")
+    check("발동 직후 연속 카운터 리셋", not again.triggered, again.describe())
+    for _ in range(cb.betti_persist - 2):
+        cb.evaluate(0.1, 0.5, shred, "KRW-BTC")
+    check("리셋 후 persist 틱을 다시 채워야 재발동",
+          cb.evaluate(0.1, 0.5, shred, "KRW-BTC").triggered)
+
     # 정상 호가가 한 번 들어오면 연속 카운터가 끊겨야 한다
     cb.evaluate(0.1, 0.5, normal_depth, "KRW-BTC")
     reset = cb.evaluate(0.1, 0.5, shred, "KRW-BTC")
@@ -142,8 +154,13 @@ def test_circuit_breaker():
     fired = cb.evaluate(0.95, 0.5, normal_depth, "KRW-BTC")
     check("점성 단독으로 발동(OR 결합)", fired.triggered, fired.describe())
 
-    fired2 = cb.evaluate(0.1, -0.8, normal_depth, "KRW-BTC")
-    check("곡률 붕괴 단독으로 발동", fired2.triggered, fired2.describe())
+    # 곡률은 2026-09-18 보정으로 기본 비활성 (한산함을 위험으로 오독하던 문제).
+    # 끈 상태에서 안 걸리고, 명시적으로 켰을 때만 걸리는지 둘 다 확인한다.
+    off = cb.evaluate(0.1, -0.8, normal_depth, "KRW-BTC")
+    check("곡률 조건 기본 비활성", not off.triggered, off.describe())
+    cb_k = CircuitBreaker(curvature_enabled=True)
+    on = cb_k.evaluate(0.1, -0.8, normal_depth, "KRW-BTC")
+    check("곡률 명시적으로 켜면 단독 발동", on.triggered, on.describe())
 
     # 종목마다 정상 Betti-0 가 달라도 각자 기준선으로 판정되는지
     cb2 = CircuitBreaker()
@@ -152,6 +169,103 @@ def test_circuit_breaker():
     weird = cb2.evaluate(0.1, 0.5, shred, "KRW-WEIRD")
     check("구조가 다른 종목은 자기 기준선 적용", not weird.triggered,
           f"단절이 평상시인 종목 -> 미발동 (임계 {cb2.betti_threshold('KRW-WEIRD'):.0f})")
+
+
+def test_recorder_replayability():
+    print("\n[2c] 기록기 재생 가능성 (기존: 브레이커 입력을 안 남겨 사후 분석 불가)")
+    import csv as _csv
+    from market_state import MarketState
+    from circuit_breaker import CircuitBreaker
+    from data_recorder import DataRecorder
+
+    m = MarketState(["KRW-BTC"])
+    feed_market(m, holes=(3, 7, 11))
+    st = m.get("KRW-BTC")
+    cb = CircuitBreaker()
+
+    tmp = tempfile.mkdtemp(prefix="coinbot-rec-")
+    try:
+        rec = DataRecorder(tmp, flush_interval=0.0, flush_rows=1)
+        result = cb.evaluate(0.1, 0.5, st.depth_curve(), "KRW-BTC")
+        rec.record_prices(m, ["KRW-BTC"], diag={"KRW-BTC": {
+            "betti0": result.betti_0, "cb_thr": "", "kappa": 0.4242,
+        }})
+        rec.flush()
+
+        with open(os.path.join(tmp, "prices", rec._today() + ".csv"),
+                  encoding="utf-8") as f:
+            rows = list(_csv.DictReader(f))
+        check("가격 CSV 에 브레이커 진단 컬럼 존재",
+              {"betti0", "cb_thr", "kappa"} <= set(rows[0].keys()),
+              ",".join(rows[0].keys()))
+        check("기록된 betti0 이 판정값과 일치",
+              int(rows[0]["betti0"]) == result.betti_0,
+              f"기록={rows[0]['betti0']} / 판정={result.betti_0}")
+        check("기록된 kappa 가 판정 시점 값", float(rows[0]["kappa"]) == 0.4242)
+
+        # 호가 사다리 원본 -- 저속 기록 + 재생 가능성
+        check("호가 사다리 스냅샷 기록", rec.record_depth(m, ["KRW-BTC"]))
+        check("간격 미도달 시 재기록 안 함",
+              not rec.record_depth(m, ["KRW-BTC"]))
+
+        with open(os.path.join(tmp, "depth", rec._today() + ".jsonl"),
+                  encoding="utf-8") as f:
+            snap = json.loads(f.readline())
+
+        # 이게 2단계의 핵심: 저장본만으로 Betti-0 를 다시 계산했을 때
+        # 라이브 판정과 같은 값이 나와야 사후 재보정이 성립한다.
+        ladder = np.asarray(list(reversed(snap["bids"])) + snap["asks"], dtype=float)
+        check("저장본으로 depth_curve 복원", np.allclose(ladder, st.depth_curve()),
+              f"{len(ladder)}단계")
+        check("저장본만으로 Betti-0 재계산 일치",
+              cb.compute_betti_0(ladder) == result.betti_0,
+              f"재생={cb.compute_betti_0(ladder)} / 원본={result.betti_0}")
+
+        stats = rec.stats()
+        check("stats 에 호가 스냅샷 반영", stats["세션_호가스냅샷"] == 1, str(stats))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_circuit_breaker_persistence():
+    print("\n[2b] 서킷브레이커 기준선 영속화 (기존: 재시작마다 초기화되어 오발동 유발)")
+    from circuit_breaker import CircuitBreaker
+    from market_state import MarketState
+
+    normal = MarketState(["KRW-BTC"])
+    feed_market(normal)
+    depth = normal.get("KRW-BTC").depth_curve()
+
+    tmp = tempfile.mkdtemp()
+    try:
+        state_path = os.path.join(tmp, "cb_state.json")
+
+        cb1 = CircuitBreaker(state_path=state_path)
+        check("저장 전 워밍업 전(임계값 없음)", cb1.betti_threshold("KRW-BTC") is None)
+        for _ in range(cb1.warmup):
+            cb1.evaluate(0.1, 0.5, depth, "KRW-BTC")
+        thr_before = cb1.betti_threshold("KRW-BTC")
+        check("워밍업 후 기준선 생김", thr_before is not None)
+        cb1.save_baseline()
+
+        # 재시작 시뮬레이션: 새 인스턴스가 저장된 기준선을 즉시 복원해야 한다
+        cb2 = CircuitBreaker(state_path=state_path)
+        thr_after = cb2.betti_threshold("KRW-BTC")
+        check("재시작 직후 워밍업 없이 판정 가능", thr_after is not None,
+              f"임계값={thr_after}")
+        check("복원된 임계값이 저장 전과 동일", thr_after == thr_before,
+              f"{thr_before} == {thr_after}")
+
+        # 오래된 기준선은 폐기해야 한다 (며칠 전 시장 구조를 그대로 쓰면 위험)
+        with open(state_path, encoding="utf-8") as f:
+            data = json.load(f)
+        data["saved_at"] = time.time() - 999999   # 아주 오래전
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        cb3 = CircuitBreaker(state_path=state_path, baseline_max_age_sec=3600.0)
+        check("오래된 기준선은 폐기하고 워밍업부터 다시", cb3.betti_threshold("KRW-BTC") is None)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def test_curvature():
@@ -269,15 +383,19 @@ def test_scheduler():
     print("\n[7] 스케줄러 (기존: int(time.time()) % N == 0 로 주기 누락)")
     from main import Scheduler
 
-    s = Scheduler()
-    check("첫 호출은 미발동(한 주기 대기)", not s.due("x", 0.05))
     import time as _t
-    _t.sleep(0.06)
-    check("주기 경과 후 발동", s.due("x", 0.05))
-    check("연속 호출은 미발동", not s.due("x", 0.05))
-    # 오래 밀려도 반드시 1회 발동하는지
-    _t.sleep(0.2)
-    check("크게 밀려도 발동 보장", s.due("x", 0.05))
+    # 주기 대비 대기 여유를 넉넉히 준다. 윈도우 타이머 해상도가 약 15ms 라
+    # 0.05초 주기에 0.06초만 기다리면 테스트 자체가 간헐적으로 깨진다.
+    INTERVAL = 0.05
+    s = Scheduler()
+    check("첫 호출은 미발동(한 주기 대기)", not s.due("x", INTERVAL))
+    _t.sleep(INTERVAL * 3)
+    check("주기 경과 후 발동", s.due("x", INTERVAL))
+    check("연속 호출은 미발동", not s.due("x", INTERVAL))
+    # 오래 밀려도 반드시 1회 발동하고, 몰아서 중복 발동하지는 않는지
+    _t.sleep(INTERVAL * 10)
+    check("크게 밀려도 발동 보장", s.due("x", INTERVAL))
+    check("밀린 주기를 몰아서 중복 발동하지 않음", not s.due("x", INTERVAL))
 
 
 def test_dry_run_execution():
@@ -389,6 +507,8 @@ if __name__ == "__main__":
 
     test_market_state()
     test_circuit_breaker()
+    test_circuit_breaker_persistence()
+    test_recorder_replayability()
     test_curvature()
     test_order_params()
     test_order_result_parsing()

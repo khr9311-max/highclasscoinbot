@@ -40,7 +40,16 @@ class DataRecorder:
     버퍼링했다가 주기적으로 flush 한다.
     """
 
-    PRICE_HEADER = ["ts", "ticker", "mid", "last", "spread", "book_imb", "flow_imb", "vol", "visc"]
+    # betti0/cb_thr/kappa 는 2026-09-18 추가.
+    # 그전까지 기록기가 브레이커 입력을 하나도 남기지 않아, 새벽 52회 오발동의
+    # 사후 재생이 불가능했다. 이 세 값만 있으면 betti_persist/betti_margin/
+    # baseline_len 재보정은 전부 오프라인으로 검증할 수 있다.
+    # (gap_multiple 이나 위상 지표 자체를 바꾸려면 호가 사다리가 필요한데,
+    #  그건 용량 때문에 record_depth 로 분리해 저속 기록한다.)
+    PRICE_HEADER = ["ts", "ticker", "mid", "last", "spread", "book_imb", "flow_imb",
+                    "vol", "visc", "betti0", "cb_thr", "kappa"]
+
+    DEPTH_INTERVAL = 10.0    # 호가 사다리 스냅샷 간격(초). 4종목 기준 약 24MB/일
 
     def __init__(
         self,
@@ -53,7 +62,8 @@ class DataRecorder:
         self.price_dir = os.path.join(base_dir, "prices")
         self.signal_dir = os.path.join(base_dir, "signals")
         self.order_dir = os.path.join(base_dir, "orders")
-        for d in (self.price_dir, self.signal_dir, self.order_dir):
+        self.depth_dir = os.path.join(base_dir, "depth")
+        for d in (self.price_dir, self.signal_dir, self.order_dir, self.depth_dir):
             os.makedirs(d, exist_ok=True)
 
         self.flush_interval = flush_interval
@@ -62,11 +72,13 @@ class DataRecorder:
 
         self._price_buf: List[List[Any]] = []
         self._last_flush = time.monotonic()
+        self._last_depth = 0.0
         self._current_day = self._today()
         self._lock = threading.Lock()
 
         self.rows_written = 0
         self.signals_written = 0
+        self.depth_written = 0
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -82,15 +94,28 @@ class DataRecorder:
     def _order_path(self, day: str) -> str:
         return os.path.join(self.order_dir, f"{day}.jsonl")
 
+    def _depth_path(self, day: str) -> str:
+        return os.path.join(self.depth_dir, f"{day}.jsonl")
+
     # ------------------------------------------------------------------
-    def record_prices(self, market_state, tickers: List[str]):
-        """매 틱 호출. 버퍼에만 쌓고 실제 쓰기는 flush 에서 한다."""
+    def record_prices(self, market_state, tickers: List[str],
+                      diag: Optional[Dict[str, Dict[str, Any]]] = None):
+        """
+        매 틱 호출. 버퍼에만 쌓고 실제 쓰기는 flush 에서 한다.
+
+        diag 는 종목별 서킷브레이커 진단값 {ticker: {"betti0":, "cb_thr":, "kappa":}}.
+        브레이커가 실제로 판정한 종목만 채워지고 나머지는 빈 칸으로 남는다.
+        발동 원인을 사후에 재생하려면 이 값이 판정 시점 그대로여야 하므로,
+        호출부는 반드시 cb.evaluate() 뒤에서 부른다.
+        """
         now = time.time()
+        diag = diag or {}
         rows = []
         for t in tickers:
             st = market_state.get(t)
             if not st or not st.last_price or not st.asks or not st.bids:
                 continue
+            d = diag.get(t) or {}
             rows.append([
                 round(now, 3), t,
                 st.mid_price, st.last_price,
@@ -99,6 +124,9 @@ class DataRecorder:
                 round(st.flow_imbalance(), 6),
                 round(st.realized_vol(), 8),
                 round(st.viscosity(), 6),
+                d.get("betti0", ""),
+                d.get("cb_thr", ""),
+                d.get("kappa", ""),
             ])
         if not rows:
             return
@@ -111,6 +139,50 @@ class DataRecorder:
             )
         if should_flush:
             self.flush()
+
+    def record_depth(self, market_state, tickers: List[str],
+                     interval: Optional[float] = None) -> bool:
+        """
+        호가 사다리 원본 스냅샷을 저속으로 남긴다.
+
+        가격 CSV 의 betti0 만으로도 persist/margin/baseline_len 재보정은 되지만,
+        gap_multiple 을 바꾸거나 위상 지표 자체를 재정의하려면 사다리 원본이
+        있어야 한다. 매 틱 남기면 4종목 기준 약 276MB/일이라 DEPTH_INTERVAL
+        (기본 10초) 간격으로만 기록한다 -> 약 24MB/일.
+
+        매 틱 호출해도 되고, 간격이 안 찼으면 아무 것도 하지 않고 False 를 준다.
+        """
+        every = self.DEPTH_INTERVAL if interval is None else interval
+        mono = time.monotonic()
+        if mono - self._last_depth < every:
+            return False
+        self._last_depth = mono
+
+        now = time.time()
+        lines = []
+        for t in tickers:
+            st = market_state.get(t)
+            if not st or not st.asks or not st.bids:
+                continue
+            lines.append(json.dumps({
+                "ts": round(now, 3),
+                "ticker": t,
+                "asks": st.asks,
+                "bids": st.bids,
+                "ask_sizes": [round(x, 8) for x in st.ask_sizes],
+                "bid_sizes": [round(x, 8) for x in st.bid_sizes],
+            }, ensure_ascii=False))
+        if not lines:
+            return False
+
+        try:
+            with open(self._depth_path(self._today()), "a", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            self.depth_written += len(lines)
+            return True
+        except Exception as e:
+            logger.error("호가 사다리 기록 실패: %s", e)
+            return False
 
     def record_signal(
         self,
@@ -239,7 +311,7 @@ class DataRecorder:
     def _purge_old(self):
         cutoff = datetime.now(KST) - timedelta(days=self.retention_days)
         removed = 0
-        for d in (self.price_dir, self.signal_dir, self.order_dir):
+        for d in (self.price_dir, self.signal_dir, self.order_dir, self.depth_dir):
             for path in glob.glob(os.path.join(d, "*")):
                 name = os.path.basename(path).split(".")[0]
                 try:
@@ -264,7 +336,8 @@ class DataRecorder:
             except Exception:
                 pass
 
-        total = dirsize(self.price_dir) + dirsize(self.signal_dir) + dirsize(self.order_dir)
+        total = (dirsize(self.price_dir) + dirsize(self.signal_dir)
+                 + dirsize(self.order_dir) + dirsize(self.depth_dir))
         days = len(glob.glob(os.path.join(self.price_dir, "*")))
         return {
             "누적_신호": n_signals,
@@ -272,6 +345,7 @@ class DataRecorder:
             "총_용량_MB": round(total / 1e6, 2),
             "일평균_MB": round(total / 1e6 / max(days, 1), 2),
             "세션_기록행": self.rows_written,
+            "세션_호가스냅샷": self.depth_written,
         }
 
     def close(self):

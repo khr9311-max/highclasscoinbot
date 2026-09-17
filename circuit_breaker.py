@@ -1,6 +1,9 @@
+import json
 import logging
+import os
+import time
 from collections import deque, defaultdict
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -45,6 +48,24 @@ class CircuitBreaker:
         (종목마다 평상시 Betti-0 가 1~10 으로 크게 다르기 때문)
       - 단일 스냅샷 스파이크를 거르기 위해 betti_persist 틱 연속 조건 추가
       - kappa 는 fisher_geometry 의 스펙트럼 엔트로피 기반(-1~+1) 값을 받음
+      - Betti-0 기준선을 디스크에 영속화 (아래 참고)
+
+    2026-09-18 라이브 보정 (새벽 5시간 15분간 52회 오발동):
+      - betti_persist 3 -> 10.
+        라이브 호가 재생 결과 margin 은 +5든 +8이든 발동률이 같았고
+        (10.1회/시), persist 를 5 이상으로 올리는 것만 0회로 떨어뜨렸다.
+        BTC 의 노이즈 스파이크는 크기(최대 18)가 아니라 지속시간(수 틱)으로
+        구분된다. 판별축이 크기가 아니므로 margin/baseline_len 은 건드리지
+        않았다.
+      - 곡률 조건 기본 비활성화 (curvature_enabled=False).
+        kappa 는 표준화된 피처 상관행렬의 스펙트럼 엔트로피라, 값이 낮다는
+        것은 "피처가 한 방향으로 몰렸다" = 호가가 얇고 한산하다는 뜻이다.
+        위험이 아니라 한산함을 재고 있어 부호가 뒤집혀 있다. 실측 음수 비율:
+        BTC 1.7% / ETH 30.0% / XRP 38.9% / SOL 59.9% (SOL 은 중앙값도 음수).
+        임계값만 내리면 증상만 가려지므로 지표 재정의 전까지 끈다.
+        ※ 종목별 평가로 확장할 때 이걸 켜둔 채로 가면 SOL/XRP 가 상시 발동
+          상태가 된다. 두 변경은 반드시 함께 간다.
+      - 발동 시 연속 카운터 리셋 (_observe_betti 참고).
     """
 
     def __init__(
@@ -53,11 +74,14 @@ class CircuitBreaker:
         kappa_star: float = -0.3,
         betti_0_star: int = 3,
         betti_margin: int = 5,
-        betti_persist: int = 3,
+        betti_persist: int = 10,
         gap_multiple: float = 3.0,
         baseline_len: int = 600,
         warmup: int = 60,
         required: int = 1,
+        curvature_enabled: bool = False,
+        state_path: Optional[str] = None,
+        baseline_max_age_sec: float = 6 * 3600.0,
     ):
         self.z_star = z_star              # 점성 게이트 임계값
         self.kappa_star = kappa_star      # 곡률 임계값 (이 아래로 내려가면 위험)
@@ -68,6 +92,7 @@ class CircuitBreaker:
         self.baseline_len = baseline_len
         self.warmup = warmup
         self.required = max(1, required)    # 몇 개 조건이 동시에 걸리면 차단할지
+        self.curvature_enabled = curvature_enabled
 
         # ------------------------------------------------------------------
         # 실측 보정 (업비트 라이브 호가창, 종목당 약 3,800 표본):
@@ -83,8 +108,69 @@ class CircuitBreaker:
         # 1초 틱 기준 0.26% 는 약 6분마다 1회라 매매 중단 트리거로는 너무 잦다.
         # margin=5 + 연속 3틱 지속 조건으로 순간 스파이크를 걸러낸다.
         # ------------------------------------------------------------------
-        self._betti_hist = defaultdict(lambda: deque(maxlen=self.baseline_len))
-        self._betti_streak = defaultdict(int)
+        self._betti_hist: Dict[str, deque] = defaultdict(lambda: deque(maxlen=self.baseline_len))
+        self._betti_streak: Dict[str, int] = defaultdict(int)
+
+        # ------------------------------------------------------------------
+        # 기준선 영속화.
+        # 이 이력이 메모리에만 있으면 프로세스 재시작마다 초기화되어, 재기동
+        # 직후 몇 분간은 '하루치 정상 분포'가 아니라 '방금 쌓인 몇 분치'로
+        # 임계값을 잡는다. 실제로 운영 중 재시작을 반복하다가 재기동 3분여
+        # 만에 비교적 흔한 수준(Betti-0=18, 과거 실측 최대치 21 이내)의
+        # 스파이크에 서킷브레이커가 걸린 사례가 있었다 - 신호 자체는 진짜였지만
+        # 기준선이 덜 여물어 margin 이 평소보다 타이트했다.
+        # 그래서 종료 시 이력을 저장하고, 시작 시 너무 오래되지 않았으면
+        # (baseline_max_age_sec 이내) 복원한다.
+        # ------------------------------------------------------------------
+        self.state_path = state_path
+        self.baseline_max_age_sec = baseline_max_age_sec
+        if self.state_path:
+            self._load_baseline()
+
+    # ---------------- 영속화 ----------------
+    def _load_baseline(self):
+        if not self.state_path or not os.path.exists(self.state_path):
+            return
+        try:
+            with open(self.state_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            logger.warning("Betti-0 기준선 로딩 실패(새로 시작): %s", e)
+            return
+
+        age = time.time() - data.get("saved_at", 0)
+        if age > self.baseline_max_age_sec:
+            logger.info(
+                "저장된 Betti-0 기준선이 %.1f시간 전 것이라 폐기하고 새로 시작합니다.",
+                age / 3600.0,
+            )
+            return
+
+        restored = 0
+        for ticker, values in data.get("hist", {}).items():
+            self._betti_hist[ticker] = deque(values, maxlen=self.baseline_len)
+            restored += 1
+        if restored:
+            logger.info(
+                "Betti-0 기준선 복원: %d개 종목 (%.1f분 전 저장분)",
+                restored, age / 60.0,
+            )
+
+    def save_baseline(self):
+        if not self.state_path:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.state_path) or ".", exist_ok=True)
+            data = {
+                "saved_at": time.time(),
+                "hist": {k: list(v) for k, v in self._betti_hist.items() if v},
+            }
+            tmp = self.state_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp, self.state_path)
+        except Exception as e:
+            logger.error("Betti-0 기준선 저장 실패: %s", e)
 
     # ---------------- 개별 조건 ----------------
     def check_viscosity_gate(self, z_t: float) -> bool:
@@ -95,7 +181,12 @@ class CircuitBreaker:
         """
         곡률이 kappa_star 아래로 떨어지면 피셔 매니폴드가 저차원으로
         붕괴 중 = 구조적 위험.
+
+        기본 비활성(curvature_enabled=False). 이유는 클래스 docstring 참고.
+        재정의 전까지는 켜지 않는다. 켜려면 curvature_enabled=True.
         """
+        if not self.curvature_enabled:
+            return False
         return kappa_t < self.kappa_star
 
     def compute_betti_0(self, orderbook_depth: np.ndarray) -> int:
@@ -134,30 +225,40 @@ class CircuitBreaker:
         baseline = float(np.median(np.fromiter(hist, dtype=float)))
         return max(float(self.betti_0_star), baseline + self.betti_margin)
 
-    def _observe_betti(self, betti_0: int, ticker: str) -> Tuple[bool, Optional[float]]:
+    def _observe_betti(self, betti_0: int,
+                       ticker: str) -> Tuple[bool, Optional[float], int]:
         """
         Betti-0 관측치를 이력에 넣고 판정한다.
         워밍업(기본 60표본) 전에는 판정하지 않는다 - 기동 직후 기준선 없이
         오발동하는 것을 막기 위함. 임계 초과가 betti_persist 틱 연속으로
         이어질 때만 True.
+
+        발동이 선 순간 연속 카운터를 0으로 되돌린다. 리셋하지 않으면 단절이
+        지속되는 동안 카운터가 계속 누적돼, main.py 의 60초 쿨다운이 풀리는
+        족족 같은 사건으로 재발동한다. 리셋 후에는 betti_persist 틱을 처음부터
+        다시 채워야 발동하므로, 한 사건은 최소 (쿨다운 + persist)틱 간격을 둔다.
         """
         self._betti_hist[ticker].append(betti_0)
         threshold = self.betti_threshold(ticker)
 
         if threshold is None:
             self._betti_streak[ticker] = 0
-            return False, None
+            return False, None, 0
 
         if betti_0 > threshold:
             self._betti_streak[ticker] += 1
         else:
             self._betti_streak[ticker] = 0
 
-        return self._betti_streak[ticker] >= self.betti_persist, threshold
+        streak = self._betti_streak[ticker]
+        if streak >= self.betti_persist:
+            self._betti_streak[ticker] = 0
+            return True, threshold, streak
+        return False, threshold, streak
 
     def check_topology_betti(self, orderbook_depth: np.ndarray,
                              ticker: str = "default") -> bool:
-        fired, _ = self._observe_betti(self.compute_betti_0(orderbook_depth), ticker)
+        fired, _, _ = self._observe_betti(self.compute_betti_0(orderbook_depth), ticker)
         return fired
 
     # ---------------- 종합 판정 ----------------
@@ -177,11 +278,11 @@ class CircuitBreaker:
             reasons.append(f"곡률 붕괴 (kappa={kappa_t:.3f} < {self.kappa_star})")
 
         betti_0 = self.compute_betti_0(orderbook_depth)
-        betti_fired, threshold = self._observe_betti(betti_0, ticker)
+        betti_fired, threshold, streak = self._observe_betti(betti_0, ticker)
         if betti_fired:
             reasons.append(
                 f"호가창 단절 (Betti-0={betti_0} > 기준 {threshold:.0f}, "
-                f"{self._betti_streak[ticker]}틱 연속)"
+                f"{streak}틱 연속)"
             )
 
         triggered = len(reasons) >= self.required
@@ -215,4 +316,30 @@ if __name__ == "__main__":
         print(f"단절 {i}틱째 : triggered={r.triggered}  {r.describe()}")
 
     print("점성 급등  :", cb.evaluate(0.95, 0.5, normal, "KRW-TEST").describe())
-    print("곡률 붕괴  :", cb.evaluate(0.2, -0.7, normal, "KRW-TEST").describe())
+
+    # 곡률은 기본 비활성. 켰을 때만 반응해야 한다.
+    off = cb.evaluate(0.2, -0.7, normal, "KRW-TEST")
+    print(f"곡률 붕괴(기본 off): triggered={off.triggered}  {off.describe()}")
+    assert not off.triggered, "곡률이 기본 비활성이어야 한다"
+
+    cb_k = CircuitBreaker(curvature_enabled=True)
+    on = cb_k.evaluate(0.2, -0.7, normal, "KRW-TEST")
+    print(f"곡률 붕괴(on)      : triggered={on.triggered}  {on.describe()}")
+    assert on.triggered, "켜면 곡률 단독으로 발동해야 한다"
+
+    # 영속화 라운드트립 검증
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "cb_state.json")
+        cb2 = CircuitBreaker(state_path=path)
+        for _ in range(cb2.warmup):
+            cb2.evaluate(0.2, 0.5, normal, "KRW-PERSIST")
+        thr_before = cb2.betti_threshold("KRW-PERSIST")
+        cb2.save_baseline()
+
+        cb3 = CircuitBreaker(state_path=path)
+        thr_after = cb3.betti_threshold("KRW-PERSIST")
+        print()
+        print(f"영속화 테스트: 저장 전 임계값={thr_before} / 재기동 직후(로딩) 임계값={thr_after}")
+        assert thr_after is not None and thr_after == thr_before, "기준선 복원 실패"
+        print("영속화 OK - 재시작 후에도 워밍업 없이 바로 판정 가능")

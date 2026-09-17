@@ -51,7 +51,10 @@ class Scheduler:
             self._next[name] = now + interval
             return False
         if now >= nxt:
-            self._next[name] = max(now, nxt + interval)
+            # 크게 밀린 경우 밀린 주기를 몰아서 실행하지 않되, 다음 발동은
+            # 반드시 interval 이후로 민다. max(now, ...) 로 두면 _next 가 now 가
+            # 되어 바로 뒤이은 호출이 또 발동한다(LLM 판단 연속 2회 등).
+            self._next[name] = max(now, nxt) + interval
             return True
         return False
 
@@ -63,7 +66,9 @@ class MainPipeline:
         self.engine = ExecutionEngine()
         self.mas = MultiAgentSystem()
         self.fisher = FisherGeometry(window_size=Config.WINDOW_SIZE)
-        self.cb = CircuitBreaker()
+        self.cb = CircuitBreaker(
+            state_path=os.path.join(Config.STATE_DIR, "circuit_breaker_baseline.json")
+        )
         self.meta_labeling = MetaLabeling()
 
         self.replay = MarketReplayBuffer()
@@ -163,9 +168,6 @@ class MainPipeline:
         self.feature_history.append(obs)
         self._update_replay_buffer(obs, st.mid_price or 0.0)
 
-        # 메타 모델 학습용 가격 시계열 적재 (버퍼링 후 주기적 flush)
-        self.recorder.record_prices(self.engine.market, Config.TARGET_TICKERS)
-
         # ---- 1. 위험 지표 산출 (전부 실측값) ----
         z_t = st.viscosity()
         if self.scheduler.due("curvature", 5.0):
@@ -184,8 +186,34 @@ class MainPipeline:
                 time.monotonic() < self._cb_active_until,
             )
 
+        # Betti-0 기준선을 주기적으로 디스크에 저장한다. 재시작마다 기준선이
+        # 사라져 얕은 데이터로 다시 워밍업하던 문제(재기동 직후 오발동 원인)
+        # 를 막기 위함. 매 틱 쓰면 낭비라 1분 간격으로만.
+        if self.scheduler.due("cb_baseline_save", 60.0):
+            self._spawn(asyncio.to_thread(self.cb.save_baseline), "cb_baseline_save")
+
         # ---- 3. 서킷 브레이커 ----
         result = self.cb.evaluate(z_t, self._last_kappa, st.depth_curve(), ticker)
+
+        # 메타 모델 학습용 가격 시계열 + 브레이커 진단값 적재.
+        # 판정 뒤·early return 앞이라는 위치가 중요하다. 예전처럼 판정 앞에
+        # 두면 그 틱의 betti0 을 아직 모르고, 뒤로 더 내리면 발동한 틱 - 즉
+        # 정작 사후 분석이 필요한 순간 - 의 기록이 통째로 빠진다.
+        # evaluate() 가 이미 이번 관측치를 이력에 넣었으므로, 여기서 읽는
+        # 임계값은 방금 판정에 쓰인 것과 같다. 워밍업 중이면 None.
+        cb_thr = self.cb.betti_threshold(ticker)
+        self.recorder.record_prices(
+            self.engine.market, Config.TARGET_TICKERS,
+            diag={ticker: {
+                "betti0": result.betti_0,
+                "cb_thr": round(cb_thr, 2) if cb_thr is not None else "",
+                "kappa": round(self._last_kappa, 6),
+            }},
+        )
+        # 호가 사다리 원본은 저속(기본 10초)으로 별도 기록. 지표 자체를
+        # 재정의할 때 필요하다. 간격이 안 찼으면 내부에서 그냥 넘어간다.
+        self.recorder.record_depth(self.engine.market, Config.TARGET_TICKERS)
+
         if result.triggered:
             if time.monotonic() > self._cb_active_until:
                 logger.critical("서킷 브레이커 발동: %s", result.describe())
@@ -464,6 +492,10 @@ class MainPipeline:
             self.recorder.close()
         except Exception as e:
             logger.error("데이터 recorder 종료 실패: %s", e)
+        try:
+            self.cb.save_baseline()
+        except Exception as e:
+            logger.error("서킷브레이커 기준선 저장 실패: %s", e)
         self.rl_agent.save_model()
         try:
             await self.engine.notifier.notify_shutdown()
