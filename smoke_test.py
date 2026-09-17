@@ -51,6 +51,28 @@ def make_orderbook(code="KRW-BTC", base=100_000_000.0, tick=1000.0, holes=()):
     }
 
 
+def make_shred(n_breaks: int, base=100.0, step=1.0, jump=500.0):
+    """
+    단절이 n_breaks 개 있는 호가 사다리를 만든다.
+
+    compute_betti_0 은 임계값을 '중앙값 갭의 gap_multiple 배'로 잡으므로,
+    단절이 과반이 되면 중앙값 자체가 커져 아무 것도 안 걸린다. 정상 갭을
+    단절 1개당 2개씩 끼워 중앙값이 정상 갭 쪽에 남도록 한다.
+
+    픽스처를 임계값 경계에 딱 붙여두면 margin 을 조정할 때마다 테스트가
+    깨지므로, 호출부는 실측 노이즈 최대치(BTC 기준 18)를 확실히 넘는
+    수준을 쓴다.
+    """
+    xs, x = [base], base
+    for _ in range(n_breaks):
+        for _ in range(2):
+            x += step
+            xs.append(x)
+        x += jump
+        xs.append(x)
+    return np.asarray(xs)
+
+
 def feed_market(market, code="KRW-BTC", n=60, holes=()):
     price = 100_000_000.0
     rng = np.random.default_rng(0)
@@ -125,10 +147,13 @@ def test_circuit_breaker():
     b0b = cb.compute_betti_0(broken_depth)
     check("단절 호가창 Betti-0 상승", b0b > b0n, f"정상={b0n} / 단절={b0b}")
 
-    # 순간 스파이크는 무시하고 지속될 때만 발동해야 한다
-    # (BTC 실측 단일틱 오발동률 0.10% = 1초틱 기준 약 17분마다 1회)
-    shred = np.array([100.0, 101, 102, 500, 501, 900, 901, 1400, 1401,
-                      2000, 2001, 2700, 2701, 3500, 3501, 4400])
+    # 순간 스파이크는 무시하고 지속될 때만 발동해야 한다.
+    # 실측 노이즈 최대치(BTC 18)를 확실히 넘는 '진짜 단절' 수준을 쓴다 -
+    # 경계선 픽스처는 margin 을 조정할 때마다 깨진다.
+    shred = make_shred(20)
+    check("합성 단절이 판정 임계값을 넘는 수준",
+          cb.compute_betti_0(shred) > thr,
+          f"betti0={cb.compute_betti_0(shred)} > 임계 {thr:.0f}")
     spike = cb.evaluate(0.1, 0.5, shred, "KRW-BTC")
     check("단절 1틱은 무시(스파이크 필터)", not spike.triggered, spike.describe())
     for _ in range(cb.betti_persist - 2):
