@@ -119,7 +119,10 @@ def test_circuit_breaker():
     from market_state import MarketState
     from circuit_breaker import CircuitBreaker
 
-    cb = CircuitBreaker()
+    # 위상 조건은 2026-09-18 보정으로 기본 비활성이다(지표가 유동성 증발을
+    # 감지하지 못함 - 아래 [2d] 참고). 지속/리셋 메커니즘 자체는 여전히
+    # 살아 있어야 하므로 명시적으로 켠 인스턴스로 검증한다.
+    cb = CircuitBreaker(topology_enabled=True)
 
     normal = MarketState(["KRW-BTC"])
     feed_market(normal)
@@ -176,6 +179,14 @@ def test_circuit_breaker():
     reset = cb.evaluate(0.1, 0.5, shred, "KRW-BTC")
     check("정상 복귀 시 연속 카운터 초기화", not reset.triggered, reset.describe())
 
+    # 기본값에서는 같은 단절이 발동하지 않아야 한다
+    cb_off = CircuitBreaker()
+    for _ in range(cb_off.warmup):
+        cb_off.evaluate(0.1, 0.5, normal_depth, "KRW-BTC")
+    for _ in range(cb_off.betti_persist + 2):
+        last_off = cb_off.evaluate(0.1, 0.5, shred, "KRW-BTC")
+    check("위상 조건 기본 비활성", not last_off.triggered, last_off.describe())
+
     fired = cb.evaluate(0.95, 0.5, normal_depth, "KRW-BTC")
     check("점성 단독으로 발동(OR 결합)", fired.triggered, fired.describe())
 
@@ -194,6 +205,39 @@ def test_circuit_breaker():
     weird = cb2.evaluate(0.1, 0.5, shred, "KRW-WEIRD")
     check("구조가 다른 종목은 자기 기준선 적용", not weird.triggered,
           f"단절이 평상시인 종목 -> 미발동 (임계 {cb2.betti_threshold('KRW-WEIRD'):.0f})")
+
+
+def test_betti_cannot_detect_withdrawal():
+    """
+    Betti-0 가 왜 꺼져 있는지를 코드로 고정해 둔다.
+
+    유동성 위기 = 호가가 취소되어 단계가 사라지는 것인데, 이 지표는 그
+    상황에서 값이 '내려간다'. 나중에 지표를 재설계하면 이 테스트가 깨지고,
+    그때 topology_enabled 기본값을 되돌릴지 함께 판단하면 된다.
+    """
+    print("\n[2d] 위상 지표 한계 (이 조건이 기본 비활성인 이유)")
+    from market_state import MarketState
+    from circuit_breaker import CircuitBreaker
+
+    m = MarketState(["KRW-BTC"])
+    feed_market(m)
+    depth = m.get("KRW-BTC").depth_curve()
+    cb = CircuitBreaker()
+
+    rng = np.random.default_rng(0)
+    vals = {}
+    for frac in (0.0, 0.6, 0.95):
+        keep = max(3, int(round(len(depth) * (1 - frac))))
+        idx = np.sort(rng.choice(len(depth), size=keep, replace=False))
+        vals[frac] = cb.compute_betti_0(depth[idx])
+
+    check("호가 60% 증발 시 Betti-0 가 오르지 않음(역전)",
+          vals[0.6] <= vals[0.0],
+          f"정상={vals[0.0]} -> 60%증발={vals[0.6]}")
+    check("호가 95% 증발이 '정상'으로 판정됨",
+          vals[0.95] <= 3,
+          f"95%증발 Betti-0={vals[0.95]} (정상 호가창과 구분 불가)")
+    check("그래서 기본 비활성", not CircuitBreaker().topology_enabled)
 
 
 def test_recorder_replayability():
@@ -533,6 +577,7 @@ if __name__ == "__main__":
     test_market_state()
     test_circuit_breaker()
     test_circuit_breaker_persistence()
+    test_betti_cannot_detect_withdrawal()
     test_recorder_replayability()
     test_curvature()
     test_order_params()

@@ -51,21 +51,38 @@ class CircuitBreaker:
       - Betti-0 기준선을 디스크에 영속화 (아래 참고)
 
     2026-09-18 라이브 보정 (새벽 5시간 15분간 52회 오발동):
-      - betti_persist 3 -> 10, betti_margin 5 -> 8.
-        1,499틱(25분) 라이브 호가 재생 결과 (BTC, 시간당 발동):
-            margin \ persist    3      5     10     15
-              +5              14.4    7.2    2.4    2.4
-              +8               4.8    2.4    0.0    0.0
-              +10              0.0    0.0    0.0    0.0
-        persist 가 1차 판별축이다 - BTC 노이즈 스파이크는 크기(최대 18)가
-        아니라 지속시간으로 구분되기 때문. 다만 persist 만 올리면 2.4회/시가
-        남고(실제 배포 후 21.7분간 1회 발동으로 확인), 이를 0으로 떨어뜨리려면
-        margin 도 +8 이 필요하다.
-        baseline_len 은 어느 조합에서도 영향이 없어 그대로 둔다.
+      - 위상(Betti-0) 조건 기본 비활성화 (topology_enabled=False).
+        임계값 문제가 아니라 지표가 감지하려는 사건에 반응하지 못한다.
+        실측 BTC 사다리(60단계)에서 호가를 실제로 취소해가며 측정한 결과:
 
-        재현율 확인: margin+8/persist10 에서도 합성 단절(Betti-0=20, 30)을
-        10틱 만에 감지한다. 놓치는 것은 10초 미만의 순간 스파이크뿐이고,
-        그건 애초에 노이즈로 분류해야 할 대상이다.
+            호가 취소   0%   40%   60%   80%   95%
+            Betti-0      7     6     5     3     1
+
+        유동성이 사라질수록 값이 내려간다. 호가창이 95% 증발한 상태가
+        Betti-0=1, 즉 '완벽히 연결된 정상 호가창'으로 판정된다.
+        compute_betti_0 이 갭을 '같은 스냅샷의 중앙값 갭'으로 정규화하기
+        때문이다 - 호가가 사라지면 모든 갭이 같이 커져 비율이 유지되고,
+        점 개수까지 줄어 셀 수 있는 갭 자체가 없어진다(3단계만 남으면
+        갭이 2개라 Betti-0 는 최대 3).
+        정규화 기준을 이력 갭으로 바꿔도 7->9 까지만 오르다 다시 3 으로
+        떨어진다. '남은 단계 사이의 간격 불규칙성'을 재는 지표로는
+        '단계가 없어지는 것'을 감지할 수 없다 - 도구가 맞지 않는다.
+
+        그동안 발동한 것은 전부 노이즈였다. 프로덕션 33분 실측 분포는
+        중앙값 7 / p90 13 / p99 16 / 최대 19 이고, 자기상관이 lag1 0.82 로
+        높아 '10틱 연속 초과'가 드문 사건이 아니다. betti_margin/
+        betti_persist 를 올리는 것은 이 노이즈 대역 안에서 문턱만 옮기는
+        일이라, 발동 빈도는 줄지만 감지 능력은 생기지 않는다.
+        (실측: margin+5/persist10 -> 2.4회/시, margin+8/persist10 -> 1.8회/시)
+
+        재설계한다면 연결성분이 아니라 단계 개수 / 총 잔량 / 가격 스팬을
+        직접 보는 쪽이어야 한다. 그때까지는 z_t 가 이 역할을 한다 -
+        rel_spread 가 들어 있어 호가가 증발하면 스프레드가 벌어져 반응한다.
+        betti0 기록은 계속 쌓으므로(_observe_betti 는 계속 호출) 재설계용
+        데이터는 끊기지 않는다.
+
+        betti_margin 8 / betti_persist 10 은 조건을 다시 켤 때를 대비해
+        남겨둔 값이다. 노이즈를 줄이긴 하지만 그것만으로는 부족하다.
       - 곡률 조건 기본 비활성화 (curvature_enabled=False).
         kappa 는 표준화된 피처 상관행렬의 스펙트럼 엔트로피라, 값이 낮다는
         것은 "피처가 한 방향으로 몰렸다" = 호가가 얇고 한산하다는 뜻이다.
@@ -89,6 +106,7 @@ class CircuitBreaker:
         warmup: int = 60,
         required: int = 1,
         curvature_enabled: bool = False,
+        topology_enabled: bool = False,
         state_path: Optional[str] = None,
         baseline_max_age_sec: float = 6 * 3600.0,
     ):
@@ -102,6 +120,7 @@ class CircuitBreaker:
         self.warmup = warmup
         self.required = max(1, required)    # 몇 개 조건이 동시에 걸리면 차단할지
         self.curvature_enabled = curvature_enabled
+        self.topology_enabled = topology_enabled
 
         # ------------------------------------------------------------------
         # 실측 보정 (업비트 라이브 호가창, 종목당 약 3,800 표본):
@@ -267,8 +286,13 @@ class CircuitBreaker:
 
     def check_topology_betti(self, orderbook_depth: np.ndarray,
                              ticker: str = "default") -> bool:
+        """
+        기본 비활성(topology_enabled=False). 이유는 클래스 docstring 참고.
+        이력 적재는 계속 하므로(_observe_betti 호출은 유지) 지표를 재설계할
+        때 쓸 데이터는 끊기지 않는다.
+        """
         fired, _, _ = self._observe_betti(self.compute_betti_0(orderbook_depth), ticker)
-        return fired
+        return fired and self.topology_enabled
 
     # ---------------- 종합 판정 ----------------
     def evaluate(
@@ -287,8 +311,10 @@ class CircuitBreaker:
             reasons.append(f"곡률 붕괴 (kappa={kappa_t:.3f} < {self.kappa_star})")
 
         betti_0 = self.compute_betti_0(orderbook_depth)
+        # 비활성일 때도 _observe_betti 는 계속 호출한다. 판정만 막고 이력은
+        # 쌓아야 지표 재설계용 데이터가 끊기지 않는다.
         betti_fired, threshold, streak = self._observe_betti(betti_0, ticker)
-        if betti_fired:
+        if betti_fired and self.topology_enabled:
             reasons.append(
                 f"호가창 단절 (Betti-0={betti_0} > 기준 {threshold:.0f}, "
                 f"{streak}틱 연속)"
