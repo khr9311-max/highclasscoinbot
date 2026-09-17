@@ -1,0 +1,40 @@
+# ---- 절대 커밋 금지 ----
+.env
+.env.local
+*.pem
+*.key
+
+# ---- 파이썬 ----
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# ---- 모델/상태 아티팩트 ----
+*.zip
+free_energy_ppo_online*
+models/
+state/
+*.pkl
+*.joblib
+
+# ---- 로그 ----
+*.log
+logs/
+
+# ---- 구글드라이브 동기화 찌꺼기 ----
+.tmp.driveupload/
+.tmp.drivedownload/
+
+# ---- OS / 에디터 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/

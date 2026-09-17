@@ -1,0 +1,29 @@
+# 검증 환경: Python 3.12.7 / Windows + Amazon Linux 2023
+# 재현성을 위해 전 버전 고정. 업그레이드는 반드시 dry-run 재검증 후.
+
+# --- 거래소 / 네트워크 ---
+upbit-sdk==0.9.0
+websockets==15.0.1
+aiohttp==3.14.3
+
+# --- LLM ---
+google-genai==2.21.0
+
+# --- 수치/데이터 ---
+numpy==2.4.6
+pandas==2.3.3
+scipy==1.18.1
+scikit-learn==1.9.0
+lightgbm==4.7.0
+POT==0.9.7.post1
+
+# --- 강화학습 ---
+torch==2.14.0
+gymnasium==1.3.0
+stable-baselines3==2.9.0
+
+# --- 설정 ---
+python-dotenv==1.2.2
+
+# --- AWS 배포 시에만 필요 (로컬은 .env 폴백이라 없어도 동작) ---
+boto3==1.40.49

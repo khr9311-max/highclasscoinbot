@@ -1,0 +1,55 @@
+[Unit]
+Description=AI Quant Trading Bot (Upbit)
+After=network-online.target chrony.service chronyd.service
+Wants=network-online.target
+
+# 반복 크래시 시 무한 재시작 루프를 막는다 (5분간 5회 초과하면 정지).
+# 이 두 지시어는 [Service] 가 아니라 [Unit] 에 있어야 systemd 가 인식한다.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=coinbot
+Group=coinbot
+WorkingDirectory=/opt/coinbot
+
+# 시크릿과 리스크 한도는 root 전용 파일에서 읽는다 (chmod 600, root:root).
+# systemd 가 root 권한으로 읽어 프로세스 환경에 주입하므로, 서비스 계정은
+# 이 파일 자체를 열어볼 수 없다.
+#
+# IAM 인스턴스 역할을 부여했다면 COINBOT_SECRETS=ssm 으로 바꾸고
+# 시크릿을 SSM Parameter Store 로 옮기는 편이 더 낫다.
+EnvironmentFile=/etc/coinbot/coinbot.env
+
+Environment="COINBOT_STATE_DIR=/var/lib/coinbot"
+Environment="AWS_DEFAULT_REGION=ap-northeast-2"
+Environment="PYTHONUNBUFFERED=1"
+Environment="PYTHONIOENCODING=utf-8"
+Environment="TZ=Asia/Seoul"
+
+ExecStart=/opt/coinbot/.venv/bin/python /opt/coinbot/main.py
+
+Restart=always
+RestartSec=10
+
+# SIGTERM 으로 정상 종료 경로를 타게 한다 (main.py 가 핸들러를 건다)
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=coinbot
+
+# ---- 최소 권한 ----
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/coinbot /opt/coinbot/state
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
