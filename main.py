@@ -17,6 +17,7 @@ from triple_barrier import MetaLabeling
 from free_energy_ppo import OnlineFreeEnergyAgent, MarketReplayBuffer, OBS_DIM
 from data_recorder import DataRecorder
 from meta_trainer import MetaTrainer
+from news_feed import NewsFeed
 
 logging.basicConfig(
     level=logging.INFO,
@@ -65,6 +66,7 @@ class MainPipeline:
 
         self.engine = ExecutionEngine()
         self.mas = MultiAgentSystem()
+        self.news_feed = NewsFeed()
         self.fisher = FisherGeometry(window_size=Config.WINDOW_SIZE)
         self.cb = CircuitBreaker(
             state_path=os.path.join(Config.STATE_DIR, "circuit_breaker_baseline.json")
@@ -273,10 +275,11 @@ class MainPipeline:
                 f"점성 {st.viscosity():.3f}"
             )
 
-            c_res, n_res = await asyncio.gather(
+            c_res, headlines = await asyncio.gather(
                 self.mas.run_crypto_agent(summary),
-                self.mas.run_news_agent("추가 뉴스 피드 미연동 - 중립으로 간주."),
+                self.news_feed.get_headlines(),
             )
+            n_res = await self.mas.run_news_agent(headlines)
 
             # LLM 이 죽었을 때 '중립 판단'으로 착각하고 매매하지 않는다.
             if not c_res.get("ok"):
@@ -497,6 +500,10 @@ class MainPipeline:
         except Exception as e:
             logger.error("서킷브레이커 기준선 저장 실패: %s", e)
         self.rl_agent.save_model()
+        try:
+            await self.news_feed.close()
+        except Exception as e:
+            logger.error("뉴스 피드 세션 종료 실패: %s", e)
         try:
             await self.engine.notifier.notify_shutdown()
         except Exception:

@@ -16,6 +16,10 @@ _SECRET_KEYS = (
     "TELEGRAM_BOT_TOKEN",
     "TELEGRAM_CHAT_ID",
     "GEMINI_API_KEY",
+    "CRYPTOPANIC_API_KEY",
+    "NAVER_CLIENT_ID",
+    "NAVER_CLIENT_SECRET",
+    "NEWSAPI_KEY",
 )
 
 
@@ -88,6 +92,10 @@ class Config:
     TELEGRAM_BOT_TOKEN = _secret("TELEGRAM_BOT_TOKEN")
     TELEGRAM_CHAT_ID = _secret("TELEGRAM_CHAT_ID")
     GEMINI_API_KEY = _secret("GEMINI_API_KEY")
+    CRYPTOPANIC_API_KEY = _secret("CRYPTOPANIC_API_KEY")
+    NAVER_CLIENT_ID = _secret("NAVER_CLIENT_ID")
+    NAVER_CLIENT_SECRET = _secret("NAVER_CLIENT_SECRET")
+    NEWSAPI_KEY = _secret("NEWSAPI_KEY")
 
     # ---- 매매 대상 ----
     TARGET_TICKERS = ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-SOL"]
@@ -122,6 +130,11 @@ class Config:
     # ---- LLM ----
     GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 
+    # ---- 뉴스 피드 (News Agent 입력, 전부 선택) ----
+    # LLM_INTERVAL_SEC(5분)마다 그대로 때리면 무료 쿼터가 금방 빠듯해진다
+    # (NewsAPI 무료 플랜 100건/일). 캐시 TTL 을 그보다 길게 둔다.
+    NEWS_CACHE_TTL_SEC = _env_float("NEWS_CACHE_TTL_SEC", 900.0)
+
     @classmethod
     def validate(cls):
         if not cls.UPBIT_ACCESS_KEY or not cls.UPBIT_SECRET_KEY:
@@ -131,6 +144,8 @@ class Config:
             logger.warning("Telegram 미설정 - 알림이 비활성화됩니다.")
         if not cls.GEMINI_API_KEY:
             logger.warning("GEMINI_API_KEY 미설정 - LLM 에이전트가 중립(HOLD)으로 동작합니다.")
+        if not any((cls.CRYPTOPANIC_API_KEY, cls.NAVER_CLIENT_ID, cls.NEWSAPI_KEY)):
+            logger.warning("뉴스 피드 전부 미설정 - News Agent 가 중립 고정으로 동작합니다.")
 
         # 리스크 파라미터 정합성. 잘못 설정된 채로 실주문이 나가는 것을 막는다.
         if cls.ORDER_SIZE_KRW < cls.MIN_ORDER_KRW:

@@ -296,6 +296,72 @@ def test_recorder_replayability():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_news_feed():
+    print("\n[2e] 뉴스 피드 (기존: 고정 문자열 - news_score 항상 0)")
+    import asyncio
+    from news_feed import (
+        parse_cryptopanic, parse_naver, parse_newsapi,
+        merge_headlines, NewsFeed, _FALLBACK_TEXT,
+    )
+
+    # ---- 파싱: 실제 API 응답 형태로(2026-09-18 실측) 검증. 네트워크 호출 없음 ----
+    cp_raw = {"results": [{"title": "Bitcoin surges past key level"},
+                          {"title": "  "}, {"title": "Ethereum ETF inflow record"}]}
+    check("CryptoPanic 파싱 - 제목 추출, 빈 제목 제외",
+          parse_cryptopanic(cp_raw) == ["Bitcoin surges past key level",
+                                        "Ethereum ETF inflow record"])
+
+    # 네이버는 제목에 <b> 태그와 HTML 엔티티를 섞어 준다 (실측 그대로)
+    nv_raw = {"items": [
+        {"title": "JP모건 &quot;ETF 헤지 줄어들면, <b>비트코인</b>이 금보다 더 오른다&quot;"},
+        {"title": "<b>암호화폐</b> 거래소 점검 공지"},
+    ]}
+    nv_parsed = parse_naver(nv_raw)
+    check("네이버 파싱 - HTML 태그/엔티티 제거",
+          nv_parsed == ['JP모건 "ETF 헤지 줄어들면, 비트코인이 금보다 더 오른다"',
+                        "암호화폐 거래소 점검 공지"],
+          str(nv_parsed))
+
+    na_ok = {"status": "ok", "articles": [{"title": "Why Bitcoin's Price Is Spiking"}]}
+    na_err = {"status": "error", "message": "rate limited"}
+    check("NewsAPI 파싱 - status=ok", parse_newsapi(na_ok) == ["Why Bitcoin's Price Is Spiking"])
+    check("NewsAPI 파싱 - status=error 는 빈 목록(쿼터 초과 등)", parse_newsapi(na_err) == [])
+
+    check("응답 형태가 아니면(None/에러 페이지) 빈 목록",
+          parse_cryptopanic(None) == [] and parse_naver({"error": "x"}) == [])
+
+    # ---- 병합: 중복 제거, 전부 비면 기존과 동일한 중립 문구로 폴백 ----
+    merged = merge_headlines(["A", "B"], ["B", "C"])
+    check("헤드라인 병합 - 중복 제거, 순서 보존", merged.split("\n") == ["- A", "- B", "- C"], merged)
+    check("전부 비면 중립 문구로 폴백(하위호환)", merge_headlines([], []) == _FALLBACK_TEXT)
+
+    # ---- 캐시: TTL 안에서는 재조회하지 않는다 (무료 쿼터 보호가 목적) ----
+    # 실제 소스 호출(_fetch_all)은 네트워크가 필요하므로 여기서는 대체해
+    # 캐시 동작만 검증한다.
+    async def _run_cache_test():
+        nf = NewsFeed(ttl_sec=1000.0)
+        calls = {"n": 0}
+
+        async def fake_fetch_all():
+            calls["n"] += 1
+            return f"headline-{calls['n']}"
+
+        nf._fetch_all = fake_fetch_all
+
+        first = await nf.get_headlines()
+        second = await nf.get_headlines()
+        check("TTL 안에서는 캐시 재사용(쿼터 절약)", first == second == "headline-1",
+              f"{first} / {second}")
+
+        nf._cache_ts -= 2000.0   # TTL 만료를 흉내
+        third = await nf.get_headlines()
+        check("TTL 만료 후 재조회", third == "headline-2", third)
+
+        await nf.close()
+
+    asyncio.run(_run_cache_test())
+
+
 def test_circuit_breaker_persistence():
     print("\n[2b] 서킷브레이커 기준선 영속화 (기존: 재시작마다 초기화되어 오발동 유발)")
     from circuit_breaker import CircuitBreaker
@@ -579,6 +645,7 @@ if __name__ == "__main__":
     test_circuit_breaker_persistence()
     test_betti_cannot_detect_withdrawal()
     test_recorder_replayability()
+    test_news_feed()
     test_curvature()
     test_order_params()
     test_order_result_parsing()
