@@ -78,6 +78,11 @@ class MainPipeline:
 
         # 메타 레이블링 학습 데이터 적재 + 자동 학습
         self.recorder = DataRecorder(Config.STATE_DIR)
+        # ExecutionEngine 은 recorder 보다 먼저 만들어져 생성자에서 못 받는다
+        # (main.py:67 vs 여기). 주문 체결/취소를 orders/*.jsonl 에 남기려면
+        # 이 연결이 필요하다 - 이게 없어서 실제 체결이 나도 로그 파일이
+        # 하나도 안 쌓이는 문제가 있었다.
+        self.engine.recorder = self.recorder
         self.meta_model_path = os.path.join(Config.STATE_DIR, "meta_model.pkl")
         self.meta_trainer = MetaTrainer(Config.STATE_DIR, self.meta_model_path)
         self._meta_bundle = None      # {"model":..., "meta":...}

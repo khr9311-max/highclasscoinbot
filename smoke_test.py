@@ -497,6 +497,92 @@ def test_order_params():
     check("시장가 매도에 volume 포함", sell.get("volume") == "0.001")
 
 
+def test_order_recording():
+    print("\n[5b] 주문 기록 (기존: record_order() 정의만 있고 호출되는 곳이 없어 실체결도 로그 0건)")
+    from config import Config
+    from execution_engine import ExecutionEngine
+    from market_state import MarketState
+    from risk_manager import RiskManager
+    from notifier import TelegramNotifier
+    from data_recorder import DataRecorder
+
+    async def run_dry_run_buy():
+        tmp = tempfile.mkdtemp(prefix="coinbot-orders-")
+        try:
+            eng = ExecutionEngine.__new__(ExecutionEngine)
+            eng.config = Config
+            eng.market = MarketState(Config.TARGET_TICKERS)
+            eng.risk = RiskManager(state_dir=tempfile.mkdtemp())
+            eng.notifier = TelegramNotifier()
+            eng.notifier.enabled = False
+            eng.active_orders = {}
+            eng.balances = {"KRW": {"balance": 1_000_000.0, "locked": 0.0, "avg_buy_price": 0.0}}
+            eng._balances_ts = 9e18
+            eng.sim_krw = 1_000_000.0
+            eng.sim_positions = {}
+            eng.client = None
+            eng.recorder = DataRecorder(tmp)
+
+            feed_market(eng.market)
+            ok = await eng.place_market_buy("KRW-BTC", 10_000)
+
+            path = os.path.join(tmp, "orders", eng.recorder._today() + ".jsonl")
+            with open(path, encoding="utf-8") as f:
+                rows = [json.loads(line) for line in f]
+            return ok, rows
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    ok, rows = asyncio.run(run_dry_run_buy())
+    check("DRY-RUN 매수 성공(기존 동작 유지)", ok)
+    check("DRY-RUN 매수가 orders/*.jsonl 에 기록됨", len(rows) == 1, str(rows))
+    if rows:
+        r = rows[0]
+        check("기록 내용 - 종목/방향/상태",
+              r["ticker"] == "KRW-BTC" and r["side"] == "bid" and r["state"] == "dry_run",
+              str(r))
+
+    async def run_fill_sync():
+        import types
+        tmp = tempfile.mkdtemp(prefix="coinbot-orders-fill-")
+        try:
+            eng = ExecutionEngine.__new__(ExecutionEngine)
+            eng.config = Config
+            eng.market = MarketState(Config.TARGET_TICKERS)
+            eng.balances = {}
+            eng._balances_ts = 9e18
+            eng.recorder = DataRecorder(tmp)
+            eng.active_orders = {
+                "fake-uuid": {"ticker": "KRW-BTC", "side": "bid",
+                             "timestamp": time.time(), "amount_krw": 10_000.0},
+            }
+
+            class FakeClient:
+                async def get_order(self, order_uuid):
+                    return types.SimpleNamespace(state="done", executed_volume=0.0001)
+
+            eng.client = FakeClient()
+
+            async def fake_refresh(force: bool = False):
+                pass
+
+            eng._refresh_balances = fake_refresh
+            await eng._sync_active_orders()
+
+            path = os.path.join(tmp, "orders", eng.recorder._today() + ".jsonl")
+            with open(path, encoding="utf-8") as f:
+                rows = [json.loads(line) for line in f]
+            return rows
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    fill_rows = asyncio.run(run_fill_sync())
+    check("체결 종료가 orders/*.jsonl 에 기록됨(핵심 - 지금까지 빠졌던 부분)",
+          len(fill_rows) == 1 and fill_rows[0]["state"] == "done", str(fill_rows))
+    check("체결량이 extra 로 같이 기록됨",
+          bool(fill_rows) and fill_rows[0].get("executed_volume") == 0.0001, str(fill_rows))
+
+
 def test_order_result_parsing():
     print("\n[5] 주문 결과 판정 (기존: 'uuid' in res 가 항상 False)")
     from upbit.types.order import Order
@@ -599,6 +685,7 @@ def test_dry_run_execution():
         eng.sim_krw = 1_000_000.0
         eng.sim_positions = {}
         eng.client = None
+        eng.recorder = None
 
         feed_market(eng.market)
 
@@ -691,6 +778,7 @@ if __name__ == "__main__":
     test_news_feed()
     test_curvature()
     test_order_params()
+    test_order_recording()
     test_order_result_parsing()
     test_risk_manager()
     test_scheduler()

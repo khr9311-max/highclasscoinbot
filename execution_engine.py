@@ -94,6 +94,13 @@ class ExecutionEngine:
         self.balances: Dict[str, Dict[str, float]] = {}
         self._balances_ts: float = 0.0
 
+        # main.py 가 DataRecorder 생성 후 주입한다(구성 순서상 여기서는
+        # 아직 없다). place_market_buy/sell, _sync_active_orders 가 이걸
+        # 통해 orders/*.jsonl 에 남긴다 - 기존에는 record_order() 자체가
+        # 정의만 있고 어디서도 호출되지 않아, 실제 체결이 나도 감사/학습용
+        # 주문 로그가 하나도 안 쌓였다.
+        self.recorder = None
+
         # DRY-RUN 모의 장부 (실주문 없이 리스크 로직을 그대로 태우기 위함)
         self.sim_krw: float = 0.0
         self.sim_positions: Dict[str, float] = {}
@@ -217,6 +224,11 @@ class ExecutionEngine:
             self.risk.register_order(ticker)
             logger.info("[DRY-RUN] 시장가 매수 %s %s원 (기준가 %s)",
                         ticker, f"{amount_krw:,.0f}", f"{price:,.2f}")
+            if self.recorder:
+                self.recorder.record_order(
+                    order_uuid=f"dryrun-{uuidlib.uuid4()}", ticker=ticker, side="bid",
+                    price=price, amount=amount_krw, state="dry_run",
+                )
             await self.notifier.notify_trade("BID", ticker, price, amount_krw, dry_run=True)
             return True
 
@@ -238,6 +250,11 @@ class ExecutionEngine:
         }
         self.risk.register_order(ticker)
         logger.info("시장가 매수 접수 uuid=%s %s %s원", order.uuid, ticker, f"{amount_krw:,.0f}")
+        if self.recorder:
+            self.recorder.record_order(
+                order_uuid=order.uuid, ticker=ticker, side="bid",
+                price=price, amount=amount_krw, state="submitted",
+            )
         await self.notifier.notify_trade("BID", ticker, price, amount_krw)
         return True
 
@@ -263,6 +280,11 @@ class ExecutionEngine:
             self.sim_krw += volume * price
             self.risk.register_order(ticker)
             logger.info("[DRY-RUN] 시장가 매도 %s %.8f (기준가 %s)", ticker, volume, f"{price:,.2f}")
+            if self.recorder:
+                self.recorder.record_order(
+                    order_uuid=f"dryrun-{uuidlib.uuid4()}", ticker=ticker, side="ask",
+                    price=price, amount=volume, state="dry_run",
+                )
             await self.notifier.notify_trade("ASK", ticker, price, volume, dry_run=True)
             return True
 
@@ -282,6 +304,11 @@ class ExecutionEngine:
         }
         self.risk.register_order(ticker)
         logger.info("시장가 매도 접수 uuid=%s %s %.8f", order.uuid, ticker, volume)
+        if self.recorder:
+            self.recorder.record_order(
+                order_uuid=order.uuid, ticker=ticker, side="ask",
+                price=price, amount=volume, state="submitted",
+            )
         await self.notifier.notify_trade("ASK", ticker, price, volume)
         return True
 
@@ -312,6 +339,14 @@ class ExecutionEngine:
             if order.state in TERMINAL_STATES:
                 logger.info("주문 종료 uuid=%s state=%s 체결량=%s",
                             order_uuid, order.state, order.executed_volume)
+                if self.recorder:
+                    self.recorder.record_order(
+                        order_uuid=order_uuid, ticker=info["ticker"], side=info["side"],
+                        price=self._price_for(info["ticker"]) or 0.0,
+                        amount=info.get("amount_krw") or info.get("volume") or 0.0,
+                        state=order.state,
+                        extra={"executed_volume": float(order.executed_volume or 0.0)},
+                    )
                 self.active_orders.pop(order_uuid, None)
                 await self._refresh_balances(force=True)
                 continue
@@ -319,6 +354,13 @@ class ExecutionEngine:
             if time.time() - info["timestamp"] > self.config.ORDER_TIMEOUT_SEC:
                 logger.warning("미체결 주문 타임아웃 - 취소: %s (%s)", order_uuid, info["ticker"])
                 await self.client.cancel_order(order_uuid)
+                if self.recorder:
+                    self.recorder.record_order(
+                        order_uuid=order_uuid, ticker=info["ticker"], side=info["side"],
+                        price=self._price_for(info["ticker"]) or 0.0,
+                        amount=info.get("amount_krw") or info.get("volume") or 0.0,
+                        state="timeout_cancel",
+                    )
                 self.active_orders.pop(order_uuid, None)
                 await self._refresh_balances(force=True)
 
