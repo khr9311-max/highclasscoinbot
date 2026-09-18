@@ -146,6 +146,13 @@ class Config:
         "META_FALLBACK_MIN_STRENGTH", MIN_ENTRY_SCORE
     )
 
+    # ---- 섀도 모드 ----
+    # True 면 TARGET_TICKERS 전체를 판정·기록하되 주문은 TARGET_TICKERS[0]
+    # (primary_ticker) 에만 낸다. 메타 모델 표본을 종목 수만큼 빨리 모으면서
+    # 금전 리스크는 늘리지 않기 위함이다.
+    # 비용: 크립토 에이전트 호출이 종목 수만큼 늘어난다(뉴스는 공유).
+    SHADOW_MODE = _env_bool("SHADOW_MODE", True)
+
     # ---- 뉴스 피드 (News Agent 입력, 전부 선택) ----
     # LLM_INTERVAL_SEC(5분)마다 그대로 때리면 무료 쿼터가 금방 빠듯해진다
     # (NewsAPI 무료 플랜 100건/일). 캐시 TTL 을 그보다 길게 둔다.

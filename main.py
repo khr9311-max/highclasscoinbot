@@ -124,9 +124,10 @@ class MainPipeline:
         task.add_done_callback(_done)
         return task
 
-    def _collect_features(self) -> Optional[np.ndarray]:
-        st = self.engine.market.get(self.primary_ticker)
-        if not st or not self.engine.market.is_ready(self.primary_ticker):
+    def _collect_features(self, ticker: Optional[str] = None) -> Optional[np.ndarray]:
+        ticker = ticker or self.primary_ticker
+        st = self.engine.market.get(ticker)
+        if not st or not self.engine.market.is_ready(ticker):
             return None
         return st.feature_vector(OBS_DIM)
 
@@ -252,7 +253,7 @@ class MainPipeline:
             if self._llm_task and not self._llm_task.done():
                 logger.warning("이전 LLM 판단이 아직 진행 중 - 이번 주기 건너뜀.")
             else:
-                self._llm_task = self._spawn(self._run_llm_decision(ticker), "llm_decision")
+                self._llm_task = self._spawn(self._run_llm_decision(), "llm_decision")
 
         # ---- 6. 온라인 학습 ----
         if self.scheduler.due("train", Config.TRAIN_INTERVAL_SEC):
@@ -263,112 +264,153 @@ class MainPipeline:
             self._spawn(self._maintain_and_train(), "meta_train")
 
     # ------------------------------------------------------------------
-    async def _run_llm_decision(self, ticker: str):
-        """LLM 3-에이전트 합의 -> RL 확인 -> 메타라벨 필터 -> 주문."""
+    def _market_summary(self, ticker: str, st, price: float) -> str:
+        return (
+            f"{ticker} | 현재가 {price:,.0f} | "
+            f"스프레드 {st.rel_spread()*100:.4f}% | "
+            f"호가불균형 {st.book_imbalance():+.3f} | "
+            f"주문흐름 {st.flow_imbalance():+.3f} | "
+            f"실현변동성 {st.realized_vol()*100:.4f}% | "
+            f"점성 {st.viscosity():.3f}"
+        )
+
+    async def _run_llm_decision(self):
+        """
+        종목별 판정. 실매매는 primary_ticker 만, 나머지는 섀도(기록만)다.
+
+        섀도를 두는 이유: 메타 모델은 BUY/SELL 표본 300건이 있어야 학습되는데
+        (meta_trainer.min_samples), BTC 단독이면 실측 4.5건/시간이라 약 3일이
+        걸린다. 그렇다고 검증 안 된 신호로 4종목 실매매를 켜면 마찰비용
+        (왕복 약 0.12%)과 리스크가 그대로 4배가 된다.
+        meta_trainer 는 라벨을 '주문 체결 여부'가 아니라 기록된 가격 시계열의
+        삼중장벽으로 만들기 때문에(executed 필드를 쓰지 않는다), 주문을 내지
+        않아도 표본이 된다. 그래서 돈은 BTC 에만 걸고 데이터는 4종목에서
+        모은다.
+
+        한계: 섀도 신호에는 슬리피지/부분체결이 없어 실제보다 낙관적이다.
+        특히 호가가 얇은 XRP/SOL 에서 차이가 크므로, 확장 판단 시 감안해야 한다.
+
+        뉴스 점수는 종목과 무관하므로 한 번만 호출하고 공유한다.
+        크립토 에이전트만 종목 수만큼 호출된다(동시 실행).
+        """
         try:
-            st = self.engine.market.get(ticker)
-            if not st:
+            live_ticker = self.primary_ticker
+            tickers = list(Config.TARGET_TICKERS) if Config.SHADOW_MODE else [live_ticker]
+
+            ready = []
+            for t in tickers:
+                st = self.engine.market.get(t)
+                if not st or not self.engine.market.is_ready(t):
+                    continue
+                price = st.last_price or st.mid_price or 0.0
+                ready.append((t, st, price))
+            if not ready:
                 return
 
-            price = st.last_price or st.mid_price or 0.0
-            summary = (
-                f"{ticker} | 현재가 {price:,.0f} | "
-                f"스프레드 {st.rel_spread()*100:.4f}% | "
-                f"호가불균형 {st.book_imbalance():+.3f} | "
-                f"주문흐름 {st.flow_imbalance():+.3f} | "
-                f"실현변동성 {st.realized_vol()*100:.4f}% | "
-                f"점성 {st.viscosity():.3f}"
-            )
-
-            c_res, headlines = await asyncio.gather(
-                self.mas.run_crypto_agent(summary),
-                self.news_feed.get_headlines(),
-            )
+            headlines = await self.news_feed.get_headlines()
             n_res = await self.mas.run_news_agent(headlines)
-
-            # LLM 이 죽었을 때 '중립 판단'으로 착각하고 매매하지 않는다.
-            if not c_res.get("ok"):
-                logger.warning("Crypto Agent 응답 실패 - 이번 주기 매매 보류.")
-                return
-
-            c_score = c_res.get("score", 0.0)
-            n_score = n_res.get("score", 0.0)
-
-            # 최종 판정은 LLM 산문이 아니라 숫자 규칙으로 한다.
-            # (multi_agent.decide_action 상단 주석 참고 - LLM 판정은 실측
-            #  59건 전부 HOLD 였고, 그중 41%는 두 점수의 부호가 일치했다.)
             if not n_res.get("ok"):
                 # 예전 규칙은 news=0 을 '합의 실패'로 보고 무조건 막았지만,
                 # 지금은 crypto 단독 기준이 올라갈 뿐 막히지는 않는다.
                 # 조용히 넘어가면 나중에 원인을 못 찾으므로 남겨둔다.
                 logger.warning("News Agent 응답 실패 - crypto 단독 기준으로 판정합니다.")
-            t_res = decide_action(c_score, n_score, Config.MIN_ENTRY_SCORE)
-            action = t_res["action"]
-            confidence = t_res["strength"]
-            logger.info(
-                "판정: %s (강도 %.2f) | crypto=%.2f news=%.2f | %s",
-                action, confidence, c_score, n_score, t_res["reason"],
-            )
+            n_score = n_res.get("score", 0.0)
 
-            obs = self._collect_features()
+            c_results = await asyncio.gather(*(
+                self.mas.run_crypto_agent(self._market_summary(t, st, price))
+                for t, st, price in ready
+            ))
 
-            def log_signal(executed: bool, why: str = ""):
-                # HOLD 를 포함해 모든 판단을 남긴다. 나중에 메타 모델이
-                # '이 신호가 실제로 통했는가'를 학습하는 표본이 된다.
-                if obs is not None:
-                    self.recorder.record_signal(
-                        ticker=ticker, features=obs, action=action,
-                        confidence=confidence, crypto_score=c_score,
-                        news_score=n_score, price=price,
-                        executed=executed, reason=why or t_res["reason"],
-                    )
-
-            if action == "HOLD":
-                log_signal(False, "HOLD")
-                return
-
-            # ---- RL 에이전트 확인 필터 ----
-            # 기존 코드에서 rl_agent 는 학습만 하고 의사결정에 전혀 쓰이지 않았다.
-            if obs is not None and self.replay.ready(128):
-                exposure = float(np.mean(self.rl_agent.get_action(obs)))
-                if (action == "BUY" and exposure < 0) or (action == "SELL" and exposure > 0):
-                    logger.info("RL 에이전트 반대 의견 (exposure=%.3f) - 주문 보류.", exposure)
-                    log_signal(False, f"RL 반대 (exposure={exposure:.3f})")
-                    return
-
-            # ---- 메타 레이블링 필터 ----
-            # 학습된 모델이 없으면 통과시키지 않는다. 기존 코드는 meta_prob 을
-            # 0.85 로 하드코딩해 필터가 항상 열려 있었다.
-            meta_prob = self._meta_probability(obs, action, confidence, c_score, n_score)
-            if meta_prob is None:
-                # 대체 게이트. 예전에는 LLM 이 스스로 매긴 confidence 를 0.7 로
-                # 잘랐지만, 지금 confidence 는 decide_action 이 낸 강도
-                # |0.7*crypto + 0.3*news| 라 스케일이 다르다. 진입 규칙이 이미
-                # 같은 값(MIN_ENTRY_SCORE)으로 걸렀으므로 여기서 또 자르면
-                # 이중 게이트가 된다. 더 엄격하게 가려면 이 값만 올리면 된다.
-                logger.info("메타 모델 미학습 - 강도 임계로 대체 판정 (강도=%.2f)", confidence)
-                if confidence < Config.META_FALLBACK_MIN_STRENGTH:
-                    logger.info("진입 강도 부족 - 주문 보류.")
-                    log_signal(False, f"강도 부족 ({confidence:.2f})")
-                    return
-            elif meta_prob < 0.6:
-                logger.info("메타 모델 필터 차단 (p=%.3f < 0.6)", meta_prob)
-                log_signal(False, f"메타 필터 차단 (p={meta_prob:.3f})")
-                return
-            else:
-                logger.info("메타 모델 통과 (p=%.3f)", meta_prob)
-
-            if action == "BUY":
-                ok = await self.engine.place_market_buy(ticker)
-            else:
-                ok = await self.engine.place_market_sell(ticker)
-            log_signal(bool(ok))
+            for (ticker, st, price), c_res in zip(ready, c_results):
+                is_live = ticker == live_ticker
+                # LLM 이 죽었을 때 '중립 판단'으로 착각하고 매매하지 않는다.
+                if not c_res.get("ok"):
+                    logger.warning("[%s] Crypto Agent 응답 실패 - 이번 주기 건너뜀.", ticker)
+                    continue
+                await self._decide_one(ticker, st, price, c_res.get("score", 0.0),
+                                      n_score, is_live)
 
         except asyncio.CancelledError:
             raise
         except Exception as e:
             logger.exception("LLM 의사결정 중 예외: %s", e)
             await self.engine.notifier.notify_error(f"LLM 의사결정 예외: {e}")
+
+    async def _decide_one(self, ticker: str, st, price: float,
+                          c_score: float, n_score: float, is_live: bool):
+        """한 종목의 판정 + 기록. is_live 일 때만 필터를 태우고 주문을 낸다."""
+        # 최종 판정은 LLM 산문이 아니라 숫자 규칙으로 한다.
+        # (multi_agent.decide_action 상단 주석 참고 - LLM 판정은 실측
+        #  59건 전부 HOLD 였고, 그중 41%는 두 점수의 부호가 일치했다.)
+        t_res = decide_action(c_score, n_score, Config.MIN_ENTRY_SCORE)
+        action = t_res["action"]
+        confidence = t_res["strength"]
+        tag = "" if is_live else "[섀도] "
+        logger.info(
+            "%s판정 %s: %s (강도 %.2f) | crypto=%.2f news=%.2f | %s",
+            tag, ticker, action, confidence, c_score, n_score, t_res["reason"],
+        )
+
+        obs = self._collect_features(ticker)
+
+        def log_signal(executed: bool, why: str = ""):
+            # HOLD 를 포함해 모든 판단을 남긴다. 나중에 메타 모델이
+            # '이 신호가 실제로 통했는가'를 학습하는 표본이 된다.
+            if obs is not None:
+                self.recorder.record_signal(
+                    ticker=ticker, features=obs, action=action,
+                    confidence=confidence, crypto_score=c_score,
+                    news_score=n_score, price=price,
+                    executed=executed, reason=why or t_res["reason"],
+                )
+
+        if action == "HOLD":
+            log_signal(False, "HOLD")
+            return
+
+        if not is_live:
+            # 섀도: 표본만 남기고 필터/주문은 타지 않는다. RL 은 BTC 특징으로
+            # 학습돼 있어 다른 종목에 그대로 적용하면 근거가 없고, 메타 필터도
+            # 아직 학습 전이라 여기서 거르면 표본만 줄어든다.
+            log_signal(False, "섀도 (기록만)")
+            return
+
+        # ---- RL 에이전트 확인 필터 ----
+        # 기존 코드에서 rl_agent 는 학습만 하고 의사결정에 전혀 쓰이지 않았다.
+        if obs is not None and self.replay.ready(128):
+            exposure = float(np.mean(self.rl_agent.get_action(obs)))
+            if (action == "BUY" and exposure < 0) or (action == "SELL" and exposure > 0):
+                logger.info("RL 에이전트 반대 의견 (exposure=%.3f) - 주문 보류.", exposure)
+                log_signal(False, f"RL 반대 (exposure={exposure:.3f})")
+                return
+
+        # ---- 메타 레이블링 필터 ----
+        # 학습된 모델이 없으면 통과시키지 않는다. 기존 코드는 meta_prob 을
+        # 0.85 로 하드코딩해 필터가 항상 열려 있었다.
+        meta_prob = self._meta_probability(obs, action, confidence, c_score, n_score)
+        if meta_prob is None:
+            # 대체 게이트. 예전에는 LLM 이 스스로 매긴 confidence 를 0.7 로
+            # 잘랐지만, 지금 confidence 는 decide_action 이 낸 강도
+            # |0.7*crypto + 0.3*news| 라 스케일이 다르다. 진입 규칙이 이미
+            # 같은 값(MIN_ENTRY_SCORE)으로 걸렀으므로 여기서 또 자르면
+            # 이중 게이트가 된다. 더 엄격하게 가려면 이 값만 올리면 된다.
+            logger.info("메타 모델 미학습 - 강도 임계로 대체 판정 (강도=%.2f)", confidence)
+            if confidence < Config.META_FALLBACK_MIN_STRENGTH:
+                logger.info("진입 강도 부족 - 주문 보류.")
+                log_signal(False, f"강도 부족 ({confidence:.2f})")
+                return
+        elif meta_prob < 0.6:
+            logger.info("메타 모델 필터 차단 (p=%.3f < 0.6)", meta_prob)
+            log_signal(False, f"메타 필터 차단 (p={meta_prob:.3f})")
+            return
+        else:
+            logger.info("메타 모델 통과 (p=%.3f)", meta_prob)
+
+        if action == "BUY":
+            ok = await self.engine.place_market_buy(ticker)
+        else:
+            ok = await self.engine.place_market_sell(ticker)
+        log_signal(bool(ok))
 
     async def _maintain_and_train(self):
         """

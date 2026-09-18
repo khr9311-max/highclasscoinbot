@@ -506,6 +506,72 @@ def test_order_params():
     check("시장가 매도에 volume 포함", sell.get("volume") == "0.001")
 
 
+def test_shadow_mode():
+    print("\n[5c] 섀도 모드 (BTC 만 실매매, 나머지는 판정·기록만)")
+    import types
+    from config import Config
+    from main import MainPipeline
+    from market_state import MarketState
+    from data_recorder import DataRecorder
+
+    tmp = tempfile.mkdtemp(prefix="coinbot-shadow-")
+    try:
+        # MainPipeline 은 생성자에서 실제 엔진/웹소켓을 만들므로 우회한다.
+        pl = MainPipeline.__new__(MainPipeline)
+        pl.primary_ticker = Config.TARGET_TICKERS[0]
+        pl.recorder = DataRecorder(tmp)
+        pl.replay = types.SimpleNamespace(ready=lambda n: False)
+        pl.engine = types.SimpleNamespace(market=MarketState(Config.TARGET_TICKERS))
+
+        orders = []
+
+        async def fake_buy(ticker, amount=None):
+            orders.append(("buy", ticker))
+            return True
+
+        async def fake_sell(ticker, volume=None):
+            orders.append(("sell", ticker))
+            return True
+
+        pl.engine.place_market_buy = fake_buy
+        pl.engine.place_market_sell = fake_sell
+        pl._meta_probability = lambda *a, **k: None
+
+        for t in Config.TARGET_TICKERS:
+            feed_market(pl.engine.market, code=t)
+
+        async def run():
+            live, shadow = Config.TARGET_TICKERS[0], Config.TARGET_TICKERS[1]
+            for ticker, is_live in ((live, True), (shadow, False)):
+                st = pl.engine.market.get(ticker)
+                # 진입이 확실히 서는 점수 (가중합 0.7*0.9+0.3*0.5 = 0.78)
+                await pl._decide_one(ticker, st, st.mid_price or 1.0,
+                                    0.9, 0.5, is_live)
+
+        asyncio.run(run())
+
+        path = os.path.join(tmp, "signals", pl.recorder._today() + ".jsonl")
+        with open(path, encoding="utf-8") as f:
+            rows = [json.loads(line) for line in f]
+
+        live_t, shadow_t = Config.TARGET_TICKERS[0], Config.TARGET_TICKERS[1]
+        by_ticker = {r["ticker"]: r for r in rows}
+
+        check("실매매 종목은 주문이 나감", orders == [("buy", live_t)], str(orders))
+        check("섀도 종목은 주문이 나가지 않음",
+              all(t != shadow_t for _, t in orders), str(orders))
+        check("두 종목 모두 신호로 기록됨",
+              {live_t, shadow_t} <= set(by_ticker), str(list(by_ticker)))
+        check("섀도 신호는 BUY/SELL 로 기록(메타 학습 표본이 됨)",
+              by_ticker[shadow_t]["action"] == "BUY", str(by_ticker[shadow_t]))
+        check("섀도 신호는 executed=False",
+              by_ticker[shadow_t]["executed"] is False)
+        check("섀도 사유가 구분되게 남음",
+              "섀도" in by_ticker[shadow_t]["reason"], by_ticker[shadow_t]["reason"])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_order_recording():
     print("\n[5b] 주문 기록 (기존: record_order() 정의만 있고 호출되는 곳이 없어 실체결도 로그 0건)")
     from config import Config
@@ -808,6 +874,7 @@ if __name__ == "__main__":
     test_news_feed()
     test_curvature()
     test_order_params()
+    test_shadow_mode()
     test_order_recording()
     test_order_result_parsing()
     test_risk_manager()
