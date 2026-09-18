@@ -254,15 +254,60 @@ class DataRecorder:
         day = self._today()
         path = self._price_path(day)
         try:
-            new_file = not os.path.exists(path)
+            need_header = self._rotate_if_schema_changed(path)
             with open(path, "a", newline="", encoding="utf-8") as f:
                 w = csv.writer(f)
-                if new_file:
+                if need_header:
                     w.writerow(self.PRICE_HEADER)
                 w.writerows(buf)
             self.rows_written += len(buf)
         except Exception as e:
             logger.error("가격 기록 flush 실패: %s", e)
+
+    def _rotate_if_schema_changed(self, path: str) -> bool:
+        """
+        헤더를 새로 써야 하면 True.
+
+        기존에는 '파일이 없을 때만' 헤더를 썼다. 그래서 운영 중에 컬럼을
+        추가하면(2026-09-18 betti0/cb_thr/kappa 추가) 그날 파일이 '옛 헤더 +
+        새 필드 수' 로 깨졌다. 실제로 9컬럼 헤더 아래 12필드 행이 섞여
+        pd.read_csv(전체)가 ParserError 를 내고, 자정 Parquet 압축이 실패했다.
+        (usecols 로 읽는 meta_trainer 는 우연히 영향을 받지 않았다.)
+
+        헤더가 지금 스키마와 다르면 기존 파일을 옆으로 옮기고 새로 시작한다.
+        옮긴 파일도 .csv 로 두어 meta_trainer 가 계속 읽을 수 있게 하고,
+        날짜 접두사를 유지해 보존기간 정리에도 걸리게 한다.
+        """
+        if not os.path.exists(path):
+            return True
+        try:
+            with open(path, "r", encoding="utf-8", newline="") as f:
+                first = f.readline()
+            header = next(csv.reader([first])) if first.strip() else []
+        except Exception as e:
+            logger.warning("기존 가격 파일 헤더 확인 실패(이어쓰기): %s", e)
+            return False
+
+        if header == list(self.PRICE_HEADER):
+            return False
+
+        base = path[:-4] if path.endswith(".csv") else path
+        backup = f"{base}.cols{len(header)}.csv"
+        n = 1
+        while os.path.exists(backup):
+            backup = f"{base}.cols{len(header)}.{n}.csv"
+            n += 1
+        try:
+            os.replace(path, backup)
+            logger.warning(
+                "가격 CSV 스키마 변경 감지 (%d컬럼 -> %d컬럼). 기존 파일을 %s 로 옮기고 "
+                "새 헤더로 시작합니다.",
+                len(header), len(self.PRICE_HEADER), os.path.basename(backup),
+            )
+        except Exception as e:
+            logger.error("가격 CSV 회전 실패(이어쓰기): %s", e)
+            return False
+        return True
 
     # ------------------------------------------------------------------
     def maintain(self):
@@ -289,7 +334,12 @@ class DataRecorder:
             return
         try:
             import pandas as pd
-            df = pd.read_csv(src)
+            # 필드 수가 헤더보다 많은 행이 섞여 있어도(운영 중 스키마 변경
+            # 흔적) 압축이 통째로 실패하지 않도록 헤더를 명시해 읽는다.
+            # _rotate_if_schema_changed 가 재발은 막지만, 그 전에 생긴
+            # 파일이 남아 있을 수 있다.
+            df = pd.read_csv(src, names=list(self.PRICE_HEADER),
+                            header=0, on_bad_lines="warn")
             dst = os.path.join(self.price_dir, f"{day}.parquet")
             df.to_parquet(dst, compression="snappy", index=False)
             before = os.path.getsize(src)

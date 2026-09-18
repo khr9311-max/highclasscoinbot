@@ -295,6 +295,39 @@ def test_recorder_replayability():
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
+    # ---- 운영 중 컬럼 추가 시 기존 파일이 깨지지 않아야 한다 ----
+    # 실제로 betti0/cb_thr/kappa 를 추가한 날, 그날 파일이 '9컬럼 헤더 +
+    # 12필드 행' 으로 깨져 자정 Parquet 압축이 ParserError 로 실패했다.
+    import csv as _csv2
+    tmp2 = tempfile.mkdtemp(prefix="coinbot-schema-")
+    try:
+        rec2 = DataRecorder(tmp2)
+        day_path = rec2._price_path(rec2._today())
+
+        # 구버전 스키마로 파일이 이미 있는 상황을 만든다
+        with open(day_path, "w", newline="", encoding="utf-8") as f:
+            w = _csv2.writer(f)
+            w.writerow(["ts", "ticker", "mid"])
+            w.writerow([1.0, "KRW-BTC", 100.0])
+
+        m2 = MarketState(["KRW-BTC"])
+        feed_market(m2)
+        rec2.record_prices(m2, ["KRW-BTC"], diag={"KRW-BTC": {"betti0": 7}})
+        rec2.flush()
+
+        with open(day_path, encoding="utf-8") as f:
+            rows = list(_csv2.reader(f))
+        widths = {len(r) for r in rows}
+        check("스키마 바뀌면 새 헤더로 다시 시작",
+              rows[0] == list(DataRecorder.PRICE_HEADER), str(rows[0]))
+        check("한 파일 안에 필드 수가 섞이지 않음", len(widths) == 1, f"필드수={widths}")
+
+        backups = [p for p in os.listdir(os.path.join(tmp2, "prices"))
+                   if ".cols" in p]
+        check("기존 파일은 보존됨(데이터 손실 없음)", len(backups) == 1, str(backups))
+    finally:
+        shutil.rmtree(tmp2, ignore_errors=True)
+
 
 def test_decide_action():
     print("\n[2f] 최종 판정 규칙 (기존: LLM 산문 판정 / 그 뒤 뉴스 거부권)")
