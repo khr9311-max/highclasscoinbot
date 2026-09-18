@@ -15,6 +15,55 @@ logger = logging.getLogger(__name__)
 
 _JSON_FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
 
+# ---------------------------------------------------------------------------
+# 최종 판정 규칙
+#
+# 원래는 Trading Agent(LLM)가 BUY/SELL/HOLD 를 직접 골랐다. 프롬프트가
+# "prefer HOLD unless the signals clearly agree" 뿐이고 'clearly agree' 를
+# 숫자로 정의하지 않아, 실측 59건이 전부 HOLD 로 나왔다. 그중 부호가 일치한
+# 경우가 24건(41%)이었는데도 그렇다. 근거 문장도 자기 점수 체계를 어겼다
+# (news=+0.25 를 "bearish", crypto=0.40/news=0.30 을 "weak/bearish" 로 서술).
+#
+# 그래서 LLM 은 점수 산출까지만 맡고, 조합과 판정은 여기서 숫자로 한다.
+# 테스트·재현이 되고 임계값을 데이터로 조정할 수 있다.
+# ---------------------------------------------------------------------------
+DEFAULT_MIN_CRYPTO = 0.3      # |crypto| 가 이 값 미만이면 진입하지 않는다
+CRYPTO_WEIGHT = 0.7           # 강도 = 0.7*|crypto| + 0.3*|news|
+NEWS_WEIGHT = 0.3
+
+
+def decide_action(crypto_score: float, news_score: float,
+                  min_crypto: float = DEFAULT_MIN_CRYPTO) -> Dict[str, Any]:
+    """
+    두 점수를 합쳐 최종 행동을 정한다.
+
+    진입 조건 (둘 다 만족해야 함):
+      1) 두 점수의 부호가 일치      - 한쪽이 0 이면 합의로 보지 않는다
+         (News Agent 가 실패하면 score 0.0 이 오므로, 이 규칙이 '조회 실패
+          시 매매하지 않음'도 같이 처리한다)
+      2) |crypto| >= min_crypto     - 약한 신호로는 들어가지 않는다
+
+    strength 는 진입 강도(0~1). 메타 모델의 입력이자, 메타 모델이 아직
+    없을 때의 대체 게이트 기준이 된다.
+    """
+    c = float(crypto_score)
+    n = float(news_score)
+    strength = round(CRYPTO_WEIGHT * abs(c) + NEWS_WEIGHT * abs(n), 4)
+
+    if abs(c) < min_crypto:
+        return {"action": "HOLD", "strength": strength,
+                "reason": f"크립토 신호 약함 (|{c:+.2f}| < {min_crypto})"}
+
+    if c == 0 or n == 0 or (c > 0) != (n > 0):
+        return {"action": "HOLD", "strength": strength,
+                "reason": f"신호 불일치 (crypto={c:+.2f}, news={n:+.2f})"}
+
+    return {
+        "action": "BUY" if c > 0 else "SELL",
+        "strength": strength,
+        "reason": f"부호 일치 · crypto={c:+.2f} news={n:+.2f} 강도={strength:.2f}",
+    }
+
 
 class MultiAgentSystem:
     """
@@ -125,6 +174,11 @@ class MultiAgentSystem:
     async def run_trading_agent(
         self, crypto_score: float, news_score: float, portfolio_state: str
     ) -> Dict[str, Any]:
+        """
+        ※ 2026-09-18 부터 매매 판정 경로에서 빠졌다. main.py 는 decide_action()
+        을 쓴다 (사유는 이 파일 상단 주석 참고). 되돌릴 수 있도록 남겨두며,
+        프롬프트 기반 판정을 다시 실험할 때 쓸 수 있다.
+        """
         sys_prompt = (
             "You are the Lead Trading Agent. You receive scores from a Crypto Agent and a "
             "News Agent plus the current portfolio state, and make the final decision. "

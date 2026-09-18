@@ -12,7 +12,7 @@ from config import Config
 from execution_engine import ExecutionEngine
 from fisher_geometry import FisherGeometry
 from circuit_breaker import CircuitBreaker
-from multi_agent import MultiAgentSystem
+from multi_agent import MultiAgentSystem, decide_action
 from triple_barrier import MetaLabeling
 from free_energy_ppo import OnlineFreeEnergyAgent, MarketReplayBuffer, OBS_DIM
 from data_recorder import DataRecorder
@@ -286,29 +286,21 @@ class MainPipeline:
                 logger.warning("Crypto Agent 응답 실패 - 이번 주기 매매 보류.")
                 return
 
-            portfolio = (
-                f"KRW {self.engine.available_krw():,.0f} / "
-                f"{ticker} 평가액 {self.engine.position_value_krw(ticker):,.0f} / "
-                f"총노출 {self.engine.total_exposure_krw():,.0f}"
-            )
-            t_res = await self.mas.run_trading_agent(
-                c_res.get("score", 0.0), n_res.get("score", 0.0), portfolio
-            )
-            if not t_res.get("ok"):
-                logger.warning("Trading Agent 응답 실패 - 매매 보류.")
-                return
+            c_score = c_res.get("score", 0.0)
+            n_score = n_res.get("score", 0.0)
 
+            # 최종 판정은 LLM 산문이 아니라 숫자 규칙으로 한다.
+            # (multi_agent.decide_action 상단 주석 참고 - LLM 판정은 실측
+            #  59건 전부 HOLD 였고, 그중 41%는 두 점수의 부호가 일치했다.)
+            t_res = decide_action(c_score, n_score, Config.MIN_CRYPTO_SCORE)
             action = t_res["action"]
-            confidence = t_res.get("confidence", 0.0)
+            confidence = t_res["strength"]
             logger.info(
-                "LLM 판단: %s (신뢰도 %.2f) | crypto=%.2f news=%.2f | %s",
-                action, confidence, c_res.get("score", 0.0), n_res.get("score", 0.0),
-                t_res.get("reasoning", "")[:120],
+                "판정: %s (강도 %.2f) | crypto=%.2f news=%.2f | %s",
+                action, confidence, c_score, n_score, t_res["reason"],
             )
 
             obs = self._collect_features()
-            c_score = c_res.get("score", 0.0)
-            n_score = n_res.get("score", 0.0)
 
             def log_signal(executed: bool, why: str = ""):
                 # HOLD 를 포함해 모든 판단을 남긴다. 나중에 메타 모델이
@@ -318,7 +310,7 @@ class MainPipeline:
                         ticker=ticker, features=obs, action=action,
                         confidence=confidence, crypto_score=c_score,
                         news_score=n_score, price=price,
-                        executed=executed, reason=why or t_res.get("reasoning", ""),
+                        executed=executed, reason=why or t_res["reason"],
                     )
 
             if action == "HOLD":
@@ -339,10 +331,16 @@ class MainPipeline:
             # 0.85 로 하드코딩해 필터가 항상 열려 있었다.
             meta_prob = self._meta_probability(obs, action, confidence, c_score, n_score)
             if meta_prob is None:
-                logger.info("메타 모델 미학습 - 신뢰도 임계로 대체 판정 (confidence=%.2f)", confidence)
-                if confidence < 0.7:
-                    logger.info("신뢰도 부족 - 주문 보류.")
-                    log_signal(False, f"신뢰도 부족 ({confidence:.2f})")
+                # 대체 게이트. 예전에는 LLM 이 스스로 매긴 confidence 를 0.7 로
+                # 잘랐지만, 지금 confidence 는 decide_action 이 낸 강도
+                # (0.7*|crypto| + 0.3*|news|) 라 스케일이 다르다. 진입 규칙이
+                # 이미 한 번 걸렀으므로 여기서 같은 입력으로 또 세게 자르면
+                # 이중 게이트가 된다. 규칙 최소치(0.7*MIN_CRYPTO_SCORE)에
+                # 맞춰두고, 더 엄격하게 가려면 이 값만 올리면 된다.
+                logger.info("메타 모델 미학습 - 강도 임계로 대체 판정 (강도=%.2f)", confidence)
+                if confidence < Config.META_FALLBACK_MIN_STRENGTH:
+                    logger.info("진입 강도 부족 - 주문 보류.")
+                    log_signal(False, f"강도 부족 ({confidence:.2f})")
                     return
             elif meta_prob < 0.6:
                 logger.info("메타 모델 필터 차단 (p=%.3f < 0.6)", meta_prob)
