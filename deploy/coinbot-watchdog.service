@@ -1,0 +1,17 @@
+[Unit]
+Description=Coinbot Watchdog (heartbeat / service / disk check)
+After=network-online.target
+
+[Service]
+Type=oneshot
+# 봇의 venv 가 깨져도 워치독은 살아야 하므로 시스템 파이썬을 쓴다.
+ExecStart=/usr/bin/python3 /opt/coinbot/deploy/watchdog.py
+# journalctl 과 /etc/coinbot/coinbot.env 를 읽어야 해서 root 로 실행한다.
+User=root
+TimeoutStartSec=60
+# 종료코드 1 = '이상을 감지해서 알림을 보냈다'는 정상 동작이다.
+# 이걸 빼면 systemd 가 유닛 실패로 기록해 진짜 고장과 구분되지 않는다.
+SuccessExitStatus=0 1
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=coinbot-watchdog
