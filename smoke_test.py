@@ -539,6 +539,61 @@ def test_order_params():
     check("시장가 매도에 volume 포함", sell.get("volume") == "0.001")
 
 
+def test_labeling_barrier_scale():
+    print("\n[9b] 삼중장벽 스케일 (기존: 관측당 변동성을 누적수익률과 비교)")
+    from meta_trainer import MetaTrainer, ROUND_TRIP_COST, MIN_BARRIER_MULT
+
+    mt = MetaTrainer(tempfile.mkdtemp(), "/tmp/unused.pkl")
+
+    # 1초 간격, 알려진 변동성으로 합성 가격 생성
+    rng = np.random.default_rng(0)
+    n = 3600
+    tick_sigma = 0.00005
+    ts = np.arange(n, dtype=float)
+    px = 100_000_000.0 * np.exp(np.cumsum(rng.normal(0, tick_sigma, n)))
+
+    per_obs = mt._ewma_vol(px)
+    horizon = mt._horizon_vol(ts, px)
+    expected = per_obs * np.sqrt(mt.horizon_sec / 1.0)
+
+    check("관측당 변동성은 설정값과 일치", abs(per_obs - tick_sigma) / tick_sigma < 0.1,
+          f"{per_obs:.6f} vs {tick_sigma:.6f}")
+    check("horizon 변동성 = 관측당 x sqrt(horizon/dt)",
+          abs(horizon - expected) < 1e-12, f"{horizon:.6f} vs {expected:.6f}")
+    check("환산 배율이 sqrt(1800)≈42배", 40 < horizon / per_obs < 45,
+          f"{horizon / per_obs:.1f}배")
+
+    # 샘플링 간격이 1초가 아니어도 맞아야 한다 (기록 데이터에 최대 11초 간격 존재)
+    h5 = mt._horizon_vol(ts * 5.0, px)
+    check("샘플링 간격이 달라지면 환산도 따라감(5초 간격)",
+          abs(h5 - per_obs * np.sqrt(mt.horizon_sec / 5.0)) < 1e-12,
+          f"{h5:.6f}")
+
+    # 핵심: 장벽이 왕복 마찰비용을 넘어야 '성공' 라벨이 수익을 뜻한다
+    side, entry_i = 1, n - 1
+    ts2 = np.arange(n + int(mt.horizon_sec) + 10, dtype=float)
+    px2 = np.concatenate([px, px[-1] * np.ones(int(mt.horizon_sec) + 10)])
+    res = mt.label_signal(float(ts2[entry_i]), side, ts2, px2)
+    check("수직 장벽 도달 후 라벨 확정됨", res is not None)
+
+    barrier = max(mt.pt_mult * horizon, MIN_BARRIER_MULT * ROUND_TRIP_COST)
+    check("장벽이 왕복 마찰비용보다 큼(성공=수익)",
+          barrier > ROUND_TRIP_COST,
+          f"장벽 {barrier*100:.4f}% > 마찰 {ROUND_TRIP_COST*100:.4f}%")
+    check("수정 전 방식이었다면 마찰비용 미만이었음(회귀 고정)",
+          mt.pt_mult * per_obs < ROUND_TRIP_COST,
+          f"구방식 {mt.pt_mult*per_obs*100:.4f}% < {ROUND_TRIP_COST*100:.4f}%")
+
+    # 초저변동 구간에서도 하한이 걸려야 한다
+    flat = np.full(n, 100_000_000.0)
+    flat[1::2] += 1.0            # 거의 움직이지 않는 가격
+    tiny = mt._horizon_vol(ts, flat)
+    floored = max(mt.pt_mult * tiny, MIN_BARRIER_MULT * ROUND_TRIP_COST)
+    check("초저변동 시 장벽 하한 적용",
+          floored >= MIN_BARRIER_MULT * ROUND_TRIP_COST,
+          f"{floored*100:.4f}%")
+
+
 def test_shadow_mode():
     print("\n[5c] 섀도 모드 (BTC 만 실매매, 나머지는 판정·기록만)")
     import types
@@ -907,6 +962,7 @@ if __name__ == "__main__":
     test_news_feed()
     test_curvature()
     test_order_params()
+    test_labeling_barrier_scale()
     test_shadow_mode()
     test_order_recording()
     test_order_result_parsing()

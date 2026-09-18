@@ -27,9 +27,15 @@ logger = logging.getLogger(__name__)
 
 # 삼중장벽 기본 설정
 DEFAULT_HORIZON_SEC = 1800.0   # 수직 장벽 30분
-DEFAULT_PT_MULT = 2.0          # 익절 = 변동성 x 2
-DEFAULT_SL_MULT = 2.0          # 손절 = 변동성 x 2
+DEFAULT_PT_MULT = 2.0          # 익절 = horizon 변동성 x 2
+DEFAULT_SL_MULT = 2.0          # 손절 = horizon 변동성 x 2
 VOL_LOOKBACK_SEC = 3600.0      # 변동성 추정 구간 1시간
+
+# 시장가 왕복 마찰비용. 업비트 KRW 마켓 수수료 0.05% x 2 + 스프레드 크로싱
+# 약 0.02% (BTC 실측). 장벽이 이보다 작으면 '성공' 라벨이 붙어도 실제로는
+# 손실이므로, 메타 모델이 수익성과 무관한 것을 학습하게 된다.
+ROUND_TRIP_COST = 0.0012
+MIN_BARRIER_MULT = 2.0         # 장벽 하한 = 왕복비용 x 2
 
 
 class MetaTrainer:
@@ -101,12 +107,43 @@ class MetaTrainer:
     # ------------------------------------------------------------------
     @staticmethod
     def _ewma_vol(prices: np.ndarray) -> float:
-        """구간 로그수익률의 표준편차."""
+        """구간 로그수익률의 표준편차. 관측 1개(=1틱) 기준이다."""
         if len(prices) < 5:
             return 0.0
         r = np.diff(np.log(prices))
         r = r[np.isfinite(r)]
         return float(np.std(r)) if r.size else 0.0
+
+    def _horizon_vol(self, ts_seg: np.ndarray, px_seg: np.ndarray) -> float:
+        """
+        관측당 변동성을 horizon(수직 장벽) 스케일로 환산한다.
+
+        이 환산이 빠져 있던 것이 라벨링의 핵심 버그였다. _ewma_vol 은 관측
+        1개당 std 를 주는데, 그 값을 진입 후 '누적' 수익률과 비교하고 있었다.
+        삼중장벽 방법론(López de Prado)은 일봉 기준이라 '1개 바'와 'horizon'
+        이 같은 자릿수여서 pt = 2*vol 이 자연스럽게 맞지만, 1초 틱에 30분
+        horizon 이면 sqrt(1800) ≈ 42배 차이가 난다.
+
+        실측(2026-09-18, BTC 16.8시간):
+            1초 std          0.0000471   -> 2*std = 0.0092%
+            왕복 마찰비용                        0.12%
+            즉 장벽이 손익분기점의 0.08배라, '성공' 라벨이 붙은 거래도
+            수수료를 내면 전부 손실이었다.
+
+        같은 파일의 폴백 상수 0.002 가 sqrt 환산값(0.001999)과 정확히 일치한다
+        - 의도는 horizon 스케일이었는데 본 계산만 관측 스케일로 남아 있었다.
+
+        샘플링 주기는 고정으로 보지 않고 실제 간격의 중앙값을 쓴다. 기록
+        데이터가 보통 1초지만 최대 11초까지 벌어지는 구간이 있다.
+        """
+        per_obs = self._ewma_vol(px_seg)
+        if per_obs <= 0 or len(ts_seg) < 2:
+            return 0.0
+        dt = float(np.median(np.diff(np.asarray(ts_seg, dtype=float))))
+        if not np.isfinite(dt) or dt <= 0:
+            return 0.0
+        n_obs = max(1.0, self.horizon_sec / dt)
+        return per_obs * float(np.sqrt(n_obs))
 
     def label_signal(
         self, ts: float, side: int, ts_arr: np.ndarray, px_arr: np.ndarray
@@ -124,14 +161,16 @@ class MetaTrainer:
         if entry <= 0:
             return None
 
-        # 진입 직전 구간으로 변동성 추정
+        # 진입 직전 구간으로 변동성 추정 (horizon 스케일)
         lo = int(np.searchsorted(ts_arr, ts - VOL_LOOKBACK_SEC, side="left"))
-        vol = self._ewma_vol(px_arr[lo:i + 1])
+        vol = self._horizon_vol(ts_arr[lo:i + 1], px_arr[lo:i + 1])
         if vol <= 0:
-            vol = 0.002   # 데이터가 부족하면 0.2% 로 대체
+            vol = 0.002   # 30분 스케일 대체값 (BTC 실측 ~0.2%)
 
-        pt = self.pt_mult * vol
-        sl = -self.sl_mult * vol
+        # 장벽이 왕복 마찰비용보다 작으면 '성공' 이 실제 수익을 뜻하지 않는다.
+        barrier = max(self.pt_mult * vol, MIN_BARRIER_MULT * ROUND_TRIP_COST)
+        pt = barrier
+        sl = -barrier * (self.sl_mult / self.pt_mult)
         deadline = ts + self.horizon_sec
 
         # 수직 장벽이 아직 안 지났으면 라벨을 확정할 수 없다
