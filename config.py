@@ -131,15 +131,17 @@ class Config:
     GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 
     # ---- 최종 판정 규칙 (multi_agent.decide_action) ----
-    # 진입 조건: 두 점수의 부호가 일치 + |crypto| >= MIN_CRYPTO_SCORE.
-    # 실측 59건(약 5시간)에 적용했을 때 예상 진입 건수:
-    #   0.5 -> 10건(17%) / 0.3 -> 16건(27%) / 부호일치만 -> 24건(41%)
-    MIN_CRYPTO_SCORE = _env_float("MIN_CRYPTO_SCORE", 0.3)
+    # 진입 조건: |0.7*crypto + 0.3*news| >= MIN_ENTRY_SCORE.
+    # 실측 95건(7.9시간)에 적용했을 때 진입률:
+    #   0.3 -> 58% / 0.4 -> 37% / 0.5 -> 13%
+    # 0.5 는 실제 급등 구간(crypto=+0.72, news=-0.20 -> 합 0.44)을 놓쳐서 0.4 로 둔다.
+    MIN_ENTRY_SCORE = _env_float("MIN_ENTRY_SCORE", 0.4)
 
-    # 메타 모델이 아직 없을 때의 대체 게이트. 진입 규칙이 이미 걸렀으므로
-    # 규칙 최소 강도에 맞춰 둔다. 올리면 학습 전까지 더 보수적으로 동작한다.
+    # 메타 모델이 아직 없을 때의 대체 게이트. 진입 규칙이 이미 같은 값으로
+    # 걸렀으므로 여기서는 이중 차단이 되지 않는다. 학습 전까지 더 보수적으로
+    # 가려면 이 값만 올리면 된다.
     META_FALLBACK_MIN_STRENGTH = _env_float(
-        "META_FALLBACK_MIN_STRENGTH", round(0.7 * MIN_CRYPTO_SCORE, 4)
+        "META_FALLBACK_MIN_STRENGTH", MIN_ENTRY_SCORE
     )
 
     # ---- 뉴스 피드 (News Agent 입력, 전부 선택) ----

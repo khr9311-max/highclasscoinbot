@@ -297,45 +297,54 @@ def test_recorder_replayability():
 
 
 def test_decide_action():
-    print("\n[2f] 최종 판정 규칙 (기존: LLM 산문 판정 - 실측 59건 전부 HOLD)")
-    from multi_agent import decide_action, DEFAULT_MIN_CRYPTO
+    print("\n[2f] 최종 판정 규칙 (기존: LLM 산문 판정 / 그 뒤 뉴스 거부권)")
+    from multi_agent import decide_action, DEFAULT_MIN_SCORE, CRYPTO_WEIGHT, NEWS_WEIGHT
     from config import Config
 
-    # 부호가 일치하고 크립토 신호가 충분하면 진입
     buy = decide_action(0.65, 0.20)
     sell = decide_action(-0.65, -0.20)
-    check("부호 일치 + 강한 크립토 -> BUY", buy["action"] == "BUY", buy["reason"])
-    check("부호 일치 + 강한 크립토(음) -> SELL", sell["action"] == "SELL", sell["reason"])
+    check("가중합이 임계 이상이면 BUY", buy["action"] == "BUY", buy["reason"])
+    check("가중합이 임계 이하(음)면 SELL", sell["action"] == "SELL", sell["reason"])
 
-    # 예전 LLM 이 HOLD 로 뭉갰던 실제 케이스들이 이제는 진입으로 판정돼야 한다
-    # (crypto=0.85/news=0.25 를 "News score is bearish" 라며 HOLD 했던 건)
+    # LLM 산문 판정이 HOLD 로 뭉갰던 실제 케이스
     revived = decide_action(0.85, 0.25)
     check("LLM 이 놓쳤던 케이스(0.85/0.25) -> BUY", revived["action"] == "BUY",
           revived["reason"])
 
-    # 부호가 다르면 아무리 세도 진입하지 않는다
-    conflict = decide_action(0.85, -0.15)
-    check("부호 불일치면 크립토가 강해도 HOLD", conflict["action"] == "HOLD",
-          conflict["reason"])
+    # 핵심 회귀: 부호 일치 규칙이 뉴스에 거부권을 줘서 놓쳤던 실제 급등 구간.
+    # 2026-09-18 16:04 KST, BTC 1분봉 급등 중 crypto=+0.72 인데 news=-0.20
+    # 때문에 HOLD 로 막혔다. 가중합에서는 0.7*0.72 + 0.3*(-0.20) = 0.444 로
+    # 진입해야 한다.
+    rally = decide_action(0.72, -0.20)
+    check("약한 역방향 뉴스가 강한 크립토를 막지 못함(실제 급등 구간)",
+          rally["action"] == "BUY", rally["reason"])
 
-    # 임계값 경계
-    check("임계값 미만이면 HOLD",
-          decide_action(0.29, 0.20, 0.3)["action"] == "HOLD")
-    check("임계값 이상이면 진입",
-          decide_action(0.30, 0.20, 0.3)["action"] == "BUY")
+    # 그렇다고 뉴스가 무시되는 것도 아니다 - 문턱을 올리고 내린다
+    check("호재 뉴스는 문턱을 낮춤 (crypto 0.40 단독은 미달, +뉴스면 진입)",
+          decide_action(0.40, 0.0)["action"] == "HOLD"
+          and decide_action(0.40, 0.45)["action"] == "BUY")
+    check("강한 악재는 사실상 거부권처럼 작동 (crypto 0.72 라도 news -0.9 면 HOLD)",
+          decide_action(0.72, -0.9)["action"] == "HOLD",
+          decide_action(0.72, -0.9)["reason"])
 
-    # News Agent 가 실패하면 score 0.0 이 온다 -> 매매하지 않아야 한다
-    check("뉴스 점수 0(조회/판단 실패 포함) -> HOLD",
-          decide_action(0.90, 0.0)["action"] == "HOLD",
-          decide_action(0.90, 0.0)["reason"])
+    # 임계값 경계 (min_score 를 직접 넘겨 검증)
+    check("임계값 미만이면 HOLD", decide_action(0.50, 0.0, 0.4)["action"] == "HOLD",
+          f"0.7*0.50={0.35}")
+    check("임계값 이상이면 진입", decide_action(0.58, 0.0, 0.4)["action"] == "BUY")
+
+    # News Agent 실패(score 0.0) - 막지는 않되 crypto 기준이 올라간다
+    check("뉴스 실패 시 crypto 단독 기준으로 올라감",
+          decide_action(0.50, 0.0)["action"] == "HOLD"
+          and decide_action(0.60, 0.0)["action"] == "BUY",
+          "0.7c >= 0.4 -> c >= 0.571")
 
     # 강도는 메타 모델 입력이자 대체 게이트 기준이라 스케일이 맞아야 한다
     s = decide_action(0.60, 0.40)["strength"]
-    check("강도 = 0.7*|crypto| + 0.3*|news|", abs(s - (0.7 * 0.6 + 0.3 * 0.4)) < 1e-9,
-          f"강도={s}")
-    check("규칙 최소 진입 강도가 대체 게이트 기준 이상(이중 차단 방지)",
-          decide_action(DEFAULT_MIN_CRYPTO, 0.01)["strength"]
-          >= Config.META_FALLBACK_MIN_STRENGTH)
+    check("강도 = |0.7*crypto + 0.3*news|",
+          abs(s - abs(CRYPTO_WEIGHT * 0.6 + NEWS_WEIGHT * 0.4)) < 1e-9, f"강도={s}")
+    check("진입 최소 강도가 대체 게이트 기준 이상(이중 차단 방지)",
+          DEFAULT_MIN_SCORE >= Config.META_FALLBACK_MIN_STRENGTH,
+          f"{DEFAULT_MIN_SCORE} >= {Config.META_FALLBACK_MIN_STRENGTH}")
 
 
 def test_news_feed():

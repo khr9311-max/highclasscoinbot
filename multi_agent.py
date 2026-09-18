@@ -27,41 +27,61 @@ _JSON_FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
 # 그래서 LLM 은 점수 산출까지만 맡고, 조합과 판정은 여기서 숫자로 한다.
 # 테스트·재현이 되고 임계값을 데이터로 조정할 수 있다.
 # ---------------------------------------------------------------------------
-DEFAULT_MIN_CRYPTO = 0.3      # |crypto| 가 이 값 미만이면 진입하지 않는다
-CRYPTO_WEIGHT = 0.7           # 강도 = 0.7*|crypto| + 0.3*|news|
+DEFAULT_MIN_SCORE = 0.4       # |가중합| 이 값 미만이면 진입하지 않는다
+CRYPTO_WEIGHT = 0.7           # 가중합 = 0.7*crypto + 0.3*news
 NEWS_WEIGHT = 0.3
 
 
 def decide_action(crypto_score: float, news_score: float,
-                  min_crypto: float = DEFAULT_MIN_CRYPTO) -> Dict[str, Any]:
+                  min_score: float = DEFAULT_MIN_SCORE) -> Dict[str, Any]:
     """
-    두 점수를 합쳐 최종 행동을 정한다.
+    두 점수의 가중합으로 최종 행동을 정한다.
 
-    진입 조건 (둘 다 만족해야 함):
-      1) 두 점수의 부호가 일치      - 한쪽이 0 이면 합의로 보지 않는다
-         (News Agent 가 실패하면 score 0.0 이 오므로, 이 규칙이 '조회 실패
-          시 매매하지 않음'도 같이 처리한다)
-      2) |crypto| >= min_crypto     - 약한 신호로는 들어가지 않는다
+        score = 0.7*crypto + 0.3*news        (부호 있는 합)
+        |score| >= min_score 이면 진입, 부호가 방향
 
-    strength 는 진입 강도(0~1). 메타 모델의 입력이자, 메타 모델이 아직
-    없을 때의 대체 게이트 기준이 된다.
+    처음에는 '두 점수의 부호 일치 + |crypto| >= 0.3' 이었는데, 이 규칙은
+    news 에 거부권을 줬다. 실측 95건(7.9시간)에서 두 신호의 성질이 전혀
+    달랐다:
+
+        crypto : 범위 -0.78~+0.85, 표준편차 0.512, 직전값과 동일 7%
+        news   : 범위 -0.25~+0.45, 표준편차 0.216, 직전값과 동일 31%
+
+    news 는 변동폭이 절반도 안 되고 3번 중 1번은 직전 값 그대로다. 헤드라인을
+    NEWS_CACHE_TTL_SEC(기본 15분) 캐시하는 데다 뉴스 자체가 일간 사이클이라
+    분 단위 가격 움직임을 따라갈 수 없다. 그 느린 신호가 빠른 신호를 거부하면서
+    |crypto|>=0.3 인 68건 중 39건(57%)이 막혔고, 그중 11건이 매수 기회였다
+    (+0.85, +0.75, +0.75, +0.72, ... 실제 급등 구간 포함).
+
+    가중합으로 바꾸면 news 는 문턱을 올리고 내리기만 한다:
+        news= 0.00 -> crypto >= 0.571 이어야 진입
+        news=+0.45 -> crypto >= 0.379   (관측 최대 호재)
+        news=-0.25 -> crypto >= 0.679   (관측 최소 악재)
+    거부권은 없지만, 진짜 악재(news=-0.9)면 crypto 가 0.96 은 돼야 하므로
+    필요한 상황에서는 사실상 거부권처럼 작동한다.
+
+    News Agent 조회/판단 실패 시에는 score 0.0 이 들어온다. 예전 규칙은 이걸
+    '합의 실패'로 보고 무조건 매매를 막았지만, 지금은 crypto 단독 기준
+    (|crypto| >= min_score/0.7)으로 올라갈 뿐 완전히 막지는 않는다.
+    호출부(main.py)가 이 경우를 로그로 남긴다.
+
+    strength 는 |score|. 메타 모델의 입력이자, 메타 모델이 아직 없을 때의
+    대체 게이트 기준이 된다.
     """
     c = float(crypto_score)
     n = float(news_score)
-    strength = round(CRYPTO_WEIGHT * abs(c) + NEWS_WEIGHT * abs(n), 4)
+    score = round(CRYPTO_WEIGHT * c + NEWS_WEIGHT * n, 4)
+    strength = round(abs(score), 4)
 
-    if abs(c) < min_crypto:
+    if strength < min_score:
         return {"action": "HOLD", "strength": strength,
-                "reason": f"크립토 신호 약함 (|{c:+.2f}| < {min_crypto})"}
-
-    if c == 0 or n == 0 or (c > 0) != (n > 0):
-        return {"action": "HOLD", "strength": strength,
-                "reason": f"신호 불일치 (crypto={c:+.2f}, news={n:+.2f})"}
+                "reason": (f"가중합 약함 ({score:+.2f}, |{score:+.2f}| < {min_score}) "
+                          f"· crypto={c:+.2f} news={n:+.2f}")}
 
     return {
-        "action": "BUY" if c > 0 else "SELL",
+        "action": "BUY" if score > 0 else "SELL",
         "strength": strength,
-        "reason": f"부호 일치 · crypto={c:+.2f} news={n:+.2f} 강도={strength:.2f}",
+        "reason": f"가중합 {score:+.2f} · crypto={c:+.2f} news={n:+.2f}",
     }
 
 
