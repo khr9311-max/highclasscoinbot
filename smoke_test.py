@@ -631,9 +631,30 @@ def test_risk_manager():
         d = rm.check_buy("KRW-BTC", 10_000, 0, 0, 1_000_000)
         check("정상 매수는 통과", bool(d), d.reason or "허용")
 
-        rm.register_order("KRW-BTC")
+        rm.register_order("KRW-BTC", "bid")
         d = rm.check_buy("KRW-BTC", 10_000, 0, 0, 1_000_000)
         check("쿨다운 중 재주문 거부", not d, d.reason)
+
+        # 일일 상한은 매수에만 건다. 예전에는 공통 게이트에 있어서 상한을
+        # 다 쓰면 청산까지 막혔는데, 급락 중에 못 파는 상태가 되므로 위험하다.
+        rm4 = RiskManager(state_dir=tempfile.mkdtemp())
+        for _ in range(Config.MAX_BUYS_PER_DAY):
+            rm4.register_order("KRW-BTC", "bid")
+        rm4.last_order_ts = {}          # 쿨다운은 이 검증의 대상이 아니라 비운다
+        check("일일 매수 상한 도달 시 매수 차단",
+              not rm4.check_buy("KRW-BTC", 10_000, 0, 0, 1_000_000),
+              rm4.check_buy("KRW-BTC", 10_000, 0, 0, 1_000_000).reason)
+        check("상한을 다 써도 매도(청산)는 통과",
+              bool(rm4.check_sell("KRW-BTC", 0.001, 0.001, 100_000_000)),
+              f"매수 {rm4.buys_today}/{Config.MAX_BUYS_PER_DAY}")
+
+        # 매도는 상한 카운터를 올리지 않아야 한다(올리면 매도만으로 매수가 막힌다)
+        rm5 = RiskManager(state_dir=tempfile.mkdtemp())
+        rm5.register_order("KRW-ETH", "ask")
+        rm5.register_order("KRW-XRP", "ask")
+        check("매도는 일일 매수 카운터를 올리지 않음",
+              rm5.buys_today == 0 and rm5.orders_today == 2,
+              f"매수 {rm5.buys_today} / 전체 {rm5.orders_today}")
 
         # 일일 손실 한도
         rm2 = RiskManager(state_dir=tempfile.mkdtemp())

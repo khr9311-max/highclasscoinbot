@@ -110,7 +110,9 @@ class Config:
     MAX_TOTAL_EXPOSURE_KRW = _env_float("MAX_TOTAL_EXPOSURE_KRW", 150_000.0)  # 전체 최대 노출
     ORDER_SIZE_KRW = _env_float("ORDER_SIZE_KRW", 10_000.0)           # 1회 주문금액
     DAILY_LOSS_LIMIT_KRW = _env_float("DAILY_LOSS_LIMIT_KRW", 30_000.0)  # 일일 손실 한도(초과 시 정지)
-    MAX_ORDERS_PER_DAY = _env_int("MAX_ORDERS_PER_DAY", 40)
+    # 일일 상한은 매수에만 건다. 매도(청산)는 세지도 막지도 않는다 -
+    # 상한을 다 쓴 상태에서 급락이 오면 팔지 못하는 상황이 되기 때문.
+    MAX_BUYS_PER_DAY = _env_int("MAX_BUYS_PER_DAY", 100)
     ORDER_COOLDOWN_SEC = _env_float("ORDER_COOLDOWN_SEC", 60.0)       # 동일 종목 재주문 최소 간격
 
     # ---- RL / 기하학 ----
@@ -176,9 +178,9 @@ class Config:
         logger.warning("=" * 60)
         logger.warning("실행 모드: %s", mode)
         logger.warning(
-            "리스크 한도 | 1회 %s원 · 종목당 %s원 · 총 %s원 · 일손실 %s원 · 일 %d건",
+            "리스크 한도 | 1회 %s원 · 종목당 %s원 · 총 %s원 · 일손실 %s원 · 일 매수 %d건(매도 무제한)",
             f"{cls.ORDER_SIZE_KRW:,.0f}", f"{cls.MAX_POSITION_KRW:,.0f}",
             f"{cls.MAX_TOTAL_EXPOSURE_KRW:,.0f}", f"{cls.DAILY_LOSS_LIMIT_KRW:,.0f}",
-            cls.MAX_ORDERS_PER_DAY,
+            cls.MAX_BUYS_PER_DAY,
         )
         logger.warning("=" * 60)

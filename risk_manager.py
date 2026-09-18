@@ -51,7 +51,8 @@ class RiskManager:
 
         self.trade_date: str = self._today()
         self.day_start_equity: Optional[float] = None
-        self.orders_today: int = 0
+        self.orders_today: int = 0     # 전체 주문(관측용)
+        self.buys_today: int = 0       # 일일 상한이 걸리는 대상
         self.halted: bool = False
         self.halt_reason: str = ""
         self.last_order_ts: Dict[str, float] = {}
@@ -74,12 +75,15 @@ class RiskManager:
             self.trade_date = d["trade_date"]
             self.day_start_equity = d.get("day_start_equity")
             self.orders_today = d.get("orders_today", 0)
+            # 구버전 상태파일에는 buys_today 가 없다. 전체 주문 수로
+            # 대체하면 실제보다 많게 잡혀 보수적으로 동작한다.
+            self.buys_today = d.get("buys_today", self.orders_today)
             self.halted = d.get("halted", False)
             self.halt_reason = d.get("halt_reason", "")
             self.last_order_ts = d.get("last_order_ts", {})
             logger.info(
-                "리스크 상태 복원: %s | 주문 %d건 | 정지=%s",
-                self.trade_date, self.orders_today, self.halted,
+                "리스크 상태 복원: %s | 매수 %d건 / 전체 %d건 | 정지=%s",
+                self.trade_date, self.buys_today, self.orders_today, self.halted,
             )
         except Exception as e:
             logger.error("리스크 상태 로딩 실패(무시하고 새로 시작): %s", e)
@@ -92,6 +96,7 @@ class RiskManager:
                     "trade_date": self.trade_date,
                     "day_start_equity": self.day_start_equity,
                     "orders_today": self.orders_today,
+                "buys_today": self.buys_today,
                     "halted": self.halted,
                     "halt_reason": self.halt_reason,
                     "last_order_ts": self.last_order_ts,
@@ -108,6 +113,7 @@ class RiskManager:
             self.trade_date = today
             self.day_start_equity = None
             self.orders_today = 0
+            self.buys_today = 0
             self.halted = False
             self.halt_reason = ""
             self._save()
@@ -173,6 +179,12 @@ class RiskManager:
                 f"({total_exposure_krw:,.0f}+{krw_amount:,.0f} > {Config.MAX_TOTAL_EXPOSURE_KRW:,.0f})",
             )
 
+        # 일일 건수 상한은 매수에만 건다. 매도(청산)는 세지도, 막지도 않는다.
+        if self.buys_today >= Config.MAX_BUYS_PER_DAY:
+            return RiskDecision(
+                False, f"일일 매수 건수 상한 도달 ({self.buys_today}/{Config.MAX_BUYS_PER_DAY})"
+            )
+
         return self._check_common(ticker)
 
     def check_sell(self, ticker: str, volume: float, held_volume: float, price: float) -> RiskDecision:
@@ -202,11 +214,11 @@ class RiskManager:
         return self._check_common(ticker)
 
     def _check_common(self, ticker: str) -> RiskDecision:
-        if self.orders_today >= Config.MAX_ORDERS_PER_DAY:
-            return RiskDecision(
-                False, f"일일 주문 건수 상한 도달 ({self.orders_today}/{Config.MAX_ORDERS_PER_DAY})"
-            )
-
+        """
+        매수/매도가 공유하는 게이트. 일일 건수 상한은 여기 없다 - 매수에만
+        건다(check_buy 참고). 예전에는 여기 있어서 상한을 다 쓰면 청산까지
+        막혔는데, 급락 중에 팔지 못하는 상태가 되므로 위험하다.
+        """
         last = self.last_order_ts.get(ticker, 0.0)
         elapsed = time.time() - last
         if elapsed < Config.ORDER_COOLDOWN_SEC:
@@ -218,8 +230,14 @@ class RiskManager:
         return ALLOW
 
     # ---------------- 주문 후 기록 ----------------
-    def register_order(self, ticker: str):
+    def register_order(self, ticker: str, side: str = "bid"):
+        """
+        주문 접수 후 호출. side 는 "bid"(매수) 또는 "ask"(매도).
+        일일 상한은 매수만 세므로 매도는 buys_today 를 올리지 않는다.
+        """
         self.orders_today += 1
+        if side == "bid":
+            self.buys_today += 1
         self.last_order_ts[ticker] = time.time()
         self._save()
 
@@ -236,6 +254,7 @@ class RiskManager:
     def summary(self) -> str:
         pnl = "미설정" if self.day_start_equity is None else f"기준 {self.day_start_equity:,.0f}원"
         return (
-            f"[{self.trade_date}] 주문 {self.orders_today}/{Config.MAX_ORDERS_PER_DAY} · "
+            f"[{self.trade_date}] 매수 {self.buys_today}/{Config.MAX_BUYS_PER_DAY} "
+            f"(전체 {self.orders_today}건) · "
             f"{pnl} · 정지={self.halted}"
         )

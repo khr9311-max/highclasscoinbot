@@ -221,7 +221,7 @@ class ExecutionEngine:
                 self.sim_positions[self._currency_of(ticker)] = (
                     self.sim_positions.get(self._currency_of(ticker), 0.0) + amount_krw / price
                 )
-            self.risk.register_order(ticker)
+            self.risk.register_order(ticker, "bid")
             logger.info("[DRY-RUN] 시장가 매수 %s %s원 (기준가 %s)",
                         ticker, f"{amount_krw:,.0f}", f"{price:,.2f}")
             if self.recorder:
@@ -248,7 +248,7 @@ class ExecutionEngine:
             "timestamp": time.time(),
             "amount_krw": amount_krw,
         }
-        self.risk.register_order(ticker)
+        self.risk.register_order(ticker, "bid")
         logger.info("시장가 매수 접수 uuid=%s %s %s원", order.uuid, ticker, f"{amount_krw:,.0f}")
         if self.recorder:
             self.recorder.record_order(
@@ -278,7 +278,7 @@ class ExecutionEngine:
             cur = self._currency_of(ticker)
             self.sim_positions[cur] = max(0.0, self.sim_positions.get(cur, 0.0) - volume)
             self.sim_krw += volume * price
-            self.risk.register_order(ticker)
+            self.risk.register_order(ticker, "ask")
             logger.info("[DRY-RUN] 시장가 매도 %s %.8f (기준가 %s)", ticker, volume, f"{price:,.2f}")
             if self.recorder:
                 self.recorder.record_order(
@@ -302,7 +302,7 @@ class ExecutionEngine:
             "timestamp": time.time(),
             "volume": volume,
         }
-        self.risk.register_order(ticker)
+        self.risk.register_order(ticker, "ask")
         logger.info("시장가 매도 접수 uuid=%s %s %.8f", order.uuid, ticker, volume)
         if self.recorder:
             self.recorder.record_order(
