@@ -109,6 +109,23 @@ def main():
     n = 0 if ds is None else len(ds[0])
     target = mt.min_samples
 
+    # 학습 자체는 4종목을 섞은 단일 풀링 모델이라(meta_trainer 는 피처에
+    # ticker 를 넣지 않는다) 목표(300)도 종목별이 아니라 합계 기준이다.
+    # 그런데 수집은 종목별로 따로 하고(크립토 에이전트/뉴스 검색 모두 개별),
+    # 실제로 종목 간 속도 차이가 크므로(BTC > XRP > ETH > SOL) 합계만 보면
+    # "절반 왔다" 가 종목별로는 전혀 고르지 않은 상태를 가릴 수 있다.
+    # raw BUY/SELL 신호 수(라벨 미확정 포함)로 종목별 현황도 같이 보여준다.
+    ticker_counts: dict = {}
+    try:
+        import collections
+        sigs = mt.load_signals()
+        c = collections.Counter(
+            s.get("ticker", "?") for s in sigs if s.get("action") in ("BUY", "SELL")
+        )
+        ticker_counts = dict(sorted(c.items(), key=lambda kv: -kv[1]))
+    except Exception as e:
+        print(f"종목별 집계 실패(무시): {e}", file=sys.stderr)
+
     prev_n = state.get("n")
     prev_ts = state.get("ts")
     rate_per_hour = None
@@ -124,7 +141,7 @@ def main():
     lines = [
         "<b>📊 메타 모델 학습 진행률</b>",
         f"{now_kst}",
-        f"표본 {n} / {target}건 ({pct:.0f}%)",
+        f"표본(합계, 4종목 풀링) {n} / {target}건 ({pct:.0f}%)",
     ]
     if rate_per_hour is not None:
         lines.append(f"최근 속도 {rate_per_hour:.1f}건/시간")
@@ -136,7 +153,17 @@ def main():
     elif prev_n is None:
         lines.append("(첫 측정 - 다음 실행부터 속도 계산)")
 
+    if ticker_counts:
+        lines.append("")
+        lines.append("<b>종목별 진입신호(BUY+SELL, 참고용)</b>")
+        lines.append("※ 학습 목표는 종목 구분 없는 합계 기준. 종목별 편차를")
+        lines.append("  보려고 별도 표기 - SOL/ETH 는 BTC 대비 표본이 적어")
+        lines.append("  합계가 목표에 닿아도 종목별 신뢰도는 다를 수 있음")
+        for tk, cnt in ticker_counts.items():
+            lines.append(f"  {tk}: {cnt}건")
+
     if n >= target:
+        lines.append("")
         lines.append("목표 도달 - 다음 1시간 주기 점검에서 자동 학습됩니다.")
 
     telegram(token, chat, "\n".join(lines))
