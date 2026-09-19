@@ -1,0 +1,14 @@
+[Unit]
+Description=Run coinbot meta-progress notifier every 3 hours
+
+[Timer]
+# 부팅 5분 후 첫 실행(진행률 즉시 확인 가능), 이후 3시간 간격.
+# 현재 실측 속도(시간당 약 9건)면 목표(300건)까지 약 16시간 - 3시간 간격이면
+# 목표 도달까지 5~6회 알림이 온다. 너무 잦지도, 너무 뜸하지도 않은 수준.
+OnBootSec=5min
+OnUnitActiveSec=3h
+AccuracySec=1min
+Unit=meta-progress.service
+
+[Install]
+WantedBy=timers.target
