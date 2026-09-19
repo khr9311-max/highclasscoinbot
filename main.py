@@ -307,28 +307,31 @@ class MainPipeline:
             if not ready:
                 return
 
-            headlines = await self.news_feed.get_headlines()
-            n_res = await self.mas.run_news_agent(headlines)
-            if not n_res.get("ok"):
-                # 예전 규칙은 news=0 을 '합의 실패'로 보고 무조건 막았지만,
-                # 지금은 crypto 단독 기준이 올라갈 뿐 막히지는 않는다.
-                # 조용히 넘어가면 나중에 원인을 못 찾으므로 남겨둔다.
-                logger.warning("News Agent 응답 실패 - crypto 단독 기준으로 판정합니다.")
-            n_score = n_res.get("score", 0.0)
-
-            c_results = await asyncio.gather(*(
-                self.mas.run_crypto_agent(self._market_summary(t, st, price))
-                for t, st, price in ready
+            # 뉴스도 종목별로 받는다. 공유 뉴스를 쓰던 때는 헤드라인이 BTC
+            # 중심이라 알트 판정을 깎았다(SOL 부호 불일치 76%, 신호 -25%).
+            headline_sets = await asyncio.gather(*(
+                self.news_feed.get_headlines(t) for t, _st, _p in ready
+            ))
+            agent_results = await asyncio.gather(*(
+                asyncio.gather(
+                    self.mas.run_crypto_agent(self._market_summary(t, st, price)),
+                    self.mas.run_news_agent(hl),
+                )
+                for (t, st, price), hl in zip(ready, headline_sets)
             ))
 
-            for (ticker, st, price), c_res in zip(ready, c_results):
+            for (ticker, st, price), (c_res, n_res) in zip(ready, agent_results):
                 is_live = ticker == live_ticker
                 # LLM 이 죽었을 때 '중립 판단'으로 착각하고 매매하지 않는다.
                 if not c_res.get("ok"):
                     logger.warning("[%s] Crypto Agent 응답 실패 - 이번 주기 건너뜀.", ticker)
                     continue
+                if not n_res.get("ok"):
+                    # 예전 규칙은 news=0 을 '합의 실패'로 보고 무조건 막았지만,
+                    # 지금은 crypto 단독 기준이 올라갈 뿐 막히지는 않는다.
+                    logger.warning("[%s] News Agent 응답 실패 - crypto 단독 기준.", ticker)
                 await self._decide_one(ticker, st, price, c_res.get("score", 0.0),
-                                      n_score, is_live)
+                                      n_res.get("score", 0.0), is_live)
 
         except asyncio.CancelledError:
             raise

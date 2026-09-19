@@ -158,6 +158,16 @@ class Config:
     # (NewsAPI 무료 플랜 100건/일). 캐시 TTL 을 그보다 길게 둔다.
     NEWS_CACHE_TTL_SEC = _env_float("NEWS_CACHE_TTL_SEC", 900.0)
 
+    # GDELT(DOC 2.0). 키가 필요 없어 후보였지만 레이트리밋이 공격적이다.
+    # 실측(2026-09-19, EC2): 10초/60초 간격으로 9회 시도해 1회만 성공, 나머지
+    # HTTP 429. 문서의 '5초에 1회' 보다 훨씬 엄격하게 걸린다.
+    #
+    # 기본 비활성인 이유는 실패해서가 아니라 '간헐적으로 성공해서' 다.
+    # 15분 갱신마다 포함/누락이 갈리면 헤드라인 집합이 바뀌고, 시장과 무관한
+    # 이유로 뉴스 점수가 출렁인다. 검증 중인 신호에 노이즈를 더할 이유가 없다.
+    # 레이트리밋이 풀리거나 다른 IP 를 쓰게 되면 이 값만 켜면 된다.
+    GDELT_ENABLED = _env_bool("GDELT_ENABLED", False)
+
     @classmethod
     def validate(cls):
         if not cls.UPBIT_ACCESS_KEY or not cls.UPBIT_SECRET_KEY:

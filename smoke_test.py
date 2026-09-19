@@ -384,8 +384,8 @@ def test_news_feed():
     print("\n[2e] 뉴스 피드 (기존: 고정 문자열 - news_score 항상 0)")
     import asyncio
     from news_feed import (
-        parse_cryptopanic, parse_naver, parse_newsapi,
-        merge_headlines, NewsFeed, _FALLBACK_TEXT,
+        parse_cryptopanic, parse_naver, parse_newsapi, parse_gdelt,
+        merge_headlines, NewsFeed, _FALLBACK_TEXT, queries_for,
     )
 
     # ---- 파싱: 실제 API 응답 형태로(2026-09-18 실측) 검증. 네트워크 호출 없음 ----
@@ -414,6 +414,23 @@ def test_news_feed():
     check("응답 형태가 아니면(None/에러 페이지) 빈 목록",
           parse_cryptopanic(None) == [] and parse_naver({"error": "x"}) == [])
 
+    # GDELT 는 제목이 토큰 단위로 띄어져 온다 (" Shares Up 6 . 8 % ")
+    gd = {"articles": [{"title": "Bitcoin  Rallies   Past  $70 , 000"}, {"title": "  "}]}
+    check("GDELT 파싱 - 중복 공백 정리",
+          parse_gdelt(gd) == ["Bitcoin Rallies Past $70 , 000"], str(parse_gdelt(gd)))
+    check("GDELT 응답 아님 -> 빈 목록", parse_gdelt(None) == [] and parse_gdelt({}) == [])
+
+    # ---- 종목별 검색어 ----
+    # 공유 뉴스를 쓰던 때 헤드라인이 BTC 중심이라 알트 판정을 깎았다
+    # (SOL 부호 불일치 76%, 신호 -25%). 종목마다 달라야 한다.
+    ko = {t: queries_for(t)["ko"] for t in
+          ("KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-SOL")}
+    check("종목별 한국어 검색어가 서로 다름", len(set(ko.values())) == 4, str(ko))
+    check("BTC 검색어에 비트코인 포함", "비트코인" in ko["KRW-BTC"])
+    check("SOL 검색어에 솔라나 포함", "솔라나" in ko["KRW-SOL"])
+    check("모르는 종목은 일반 크립토 검색어로 폴백",
+          queries_for("KRW-DOGE")["ko"] == queries_for(None)["ko"])
+
     # ---- 병합: 중복 제거, 전부 비면 기존과 동일한 중립 문구로 폴백 ----
     merged = merge_headlines(["A", "B"], ["B", "C"])
     check("헤드라인 병합 - 중복 제거, 순서 보존", merged.split("\n") == ["- A", "- B", "- C"], merged)
@@ -426,20 +443,28 @@ def test_news_feed():
         nf = NewsFeed(ttl_sec=1000.0)
         calls = {"n": 0}
 
-        async def fake_fetch_all():
+        async def fake_fetch_all(ticker=None):
             calls["n"] += 1
             return f"headline-{calls['n']}"
 
         nf._fetch_all = fake_fetch_all
 
-        first = await nf.get_headlines()
-        second = await nf.get_headlines()
+        first = await nf.get_headlines("KRW-BTC")
+        second = await nf.get_headlines("KRW-BTC")
         check("TTL 안에서는 캐시 재사용(쿼터 절약)", first == second == "headline-1",
               f"{first} / {second}")
 
-        nf._cache_ts -= 2000.0   # TTL 만료를 흉내
-        third = await nf.get_headlines()
-        check("TTL 만료 후 재조회", third == "headline-2", third)
+        # 캐시는 종목별로 분리돼야 한다. 공유 캐시였다면 ETH 가 BTC 헤드라인을
+        # 그대로 받아, 종목별 쿼리를 넣은 의미가 없어진다.
+        eth = await nf.get_headlines("KRW-ETH")
+        check("종목이 다르면 캐시를 공유하지 않음", eth == "headline-2", eth)
+        check("BTC 캐시는 그대로 유지",
+              await nf.get_headlines("KRW-BTC") == "headline-1")
+
+        text, ts = nf._cache["KRW-BTC"]
+        nf._cache["KRW-BTC"] = (text, ts - 2000.0)   # TTL 만료를 흉내
+        third = await nf.get_headlines("KRW-BTC")
+        check("TTL 만료 후 재조회", third == "headline-3", third)
 
         await nf.close()
 
