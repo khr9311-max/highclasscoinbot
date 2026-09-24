@@ -19,7 +19,7 @@ import logging
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
-from .errors import (BinanceAPIError, CODE_CANCEL_REJECTED, CODE_NO_NEED_MARGIN_TYPE,
+from .errors import (BinanceAPIError, ExchangeError, CODE_CANCEL_REJECTED, CODE_NO_NEED_MARGIN_TYPE,
                      CODE_NO_SUCH_ORDER, LiveOrderBlocked, OrderStatusUnknown, outcome_unknown)
 from .gateway import ExchangeGateway
 from .models import (ALGO_STATUS_MAP, AccountInfo, AssetBalance, Fill, OrderRequest, OrderState,
@@ -42,8 +42,8 @@ def parse_order(d: Dict[str, Any]) -> OrderState:
         orig_qty=dec(d.get("origQty")), executed_qty=dec(d.get("executedQty")),
         avg_price=avg if avg > 0 else None,
         trigger_price=fnum(d.get("stopPrice"), 0.0) or None,
-        reduce_only=bool(d.get("reduceOnly", False)),
-        close_position=bool(d.get("closePosition", False)),
+        reduce_only=_b(d.get("reduceOnly", False)),
+        close_position=_b(d.get("closePosition", False)),
         working_type=d.get("workingType"),
         update_time_ms=int(d.get("updateTime") or d.get("time") or 0), raw=dict(d))
 
@@ -192,19 +192,63 @@ class BinanceGateway(ExchangeGateway):
 
     async def get_user_trades(self, symbol: str, start_ms: Optional[int] = None,
                               order_id: Optional[str] = None) -> List[Fill]:
-        params: Dict[str, Any] = {"symbol": symbol, "limit": 1000}
-        if order_id:
-            params["orderId"] = order_id
-        elif start_ms:
-            params["startTime"] = start_ms
-        rows = await self.rest.signed("GET", "/dapi/v1/userTrades", params)
-        return [parse_trade(r) for r in rows or []]
+        end = self.rest.now_ms()
+        week = 7 * 86400_000
+        start = int(start_ms) if start_ms is not None else end - week
+        found = {}
+        while start <= end:
+            stop = min(start + week - 1, end)
+            cursor = None
+            while True:
+                params: Dict[str, Any] = {"symbol": symbol, "limit": 1000}
+                if order_id:
+                    params["orderId"] = order_id
+                if cursor is None:
+                    params.update(startTime=start, endTime=stop)
+                else:
+                    # fromId cannot be combined with startTime/endTime. Time-only
+                    # pagination would drop fills sharing the last millisecond.
+                    params["fromId"] = cursor
+                rows = await self.rest.signed("GET", "/dapi/v1/userTrades", params) or []
+                for r in rows:
+                    if start <= int(r["time"]) <= stop:
+                        found[str(r["id"])] = parse_trade(r)
+                if len(rows) < 1000 or any(int(r["time"]) > stop for r in rows):
+                    break
+                next_id = max(int(r["id"]) for r in rows) + 1
+                if cursor is not None and next_id <= cursor:
+                    raise ExchangeError("userTrades pagination did not advance")
+                cursor = next_id
+            start = stop + 1
+        return sorted(found.values(), key=lambda f: (f.time_ms, int(f.trade_id)))
 
     async def get_income(self, symbol: str, income_type: Optional[str] = None,
                          start_ms: Optional[int] = None) -> List[Dict[str, Any]]:
-        params: Dict[str, Any] = {"symbol": symbol, "incomeType": income_type,
-                                  "startTime": start_ms, "limit": 1000}
-        return list(await self.rest.signed("GET", "/dapi/v1/income", params) or [])
+        end = self.rest.now_ms()
+        start = int(start_ms) if start_ms is not None else end - 7 * 86400_000
+        found = {}
+        while start <= end:
+            stop = min(start + 365 * 86400_000 - 1, end)
+            page = 1
+            while True:
+                params = {"symbol": symbol, "incomeType": income_type, "startTime": start,
+                          "endTime": stop, "limit": 1000, "page": page}
+                rows = await self.rest.signed("GET", "/dapi/v1/income", params) or []
+                before = len(found)
+                for r in rows:
+                    found[(r["incomeType"], str(r["tranId"]))] = r
+                if len(rows) < 1000:
+                    break
+                if len(found) == before:
+                    raise ExchangeError("income pagination did not advance")
+                page += 1
+            start = stop + 1
+        return sorted(found.values(), key=lambda r: int(r["time"]))
+
+    async def funding_marks(self, symbol: str, start_ms: int, end_ms: int) -> Dict[int, float]:
+        from .market_data import MarketData
+        rows = await MarketData(self.rest).funding_history(symbol, start_ms, end_ms)
+        return {r.funding_time_ms: r.mark_price for r in rows if r.mark_price is not None}
 
     # ---- 주문 변경 ----
     async def place_order(self, req: OrderRequest) -> OrderState:

@@ -97,7 +97,7 @@ class RecoveryManager:
         if t is not None and not t.entry_avg_price:
             en = t.orders.get("entry")
             row = ctx.db.get_order(en) if en else None
-            if row and row["status"] in ("PENDING_SUBMIT", "UNKNOWN", "NEW", "PARTIALLY_FILLED"):
+            if row and row["status"] not in ("NOT_PLACED", "REJECTED"):
                 try:
                     st = await ctx.resolve(en, False)
                 except OrderStatusUnknown:
@@ -112,6 +112,9 @@ class RecoveryManager:
                     elif st.is_terminal:
                         await self._cancel_pending(t, f"stale_entry:{st.status}")
                         act(f"stale_entry_cancelled:{t.trade_id}")
+                    else:
+                        issue(f"entry_status_unknown:{t.trade_id}:still_open")
+                        eng.halts["recovery"] = "진입 주문 체결 대기 - 추가 진입 차단"
                 elif st is not None:
                     ctx.db.upsert_order({"client_order_id": en, "status": "NOT_PLACED"})
                     if qty == 0:
@@ -185,6 +188,8 @@ class RecoveryManager:
                             await eng.protection.place_tps(t)
                             eng.protection.refresh_state(t)
                     await ctx.sync_fills(t)
+                    if t.state != CLOSED:
+                        await ctx.sync_funding(t, int((t.opened_at or t.created_ts) * 1000))
                     ctx.recompute_accounting(t)
                     ctx.save(t)
         else:

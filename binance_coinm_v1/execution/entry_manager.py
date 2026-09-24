@@ -43,7 +43,8 @@ class EntryManager:
     def arm(self, sig: TradeSignal, signal_id: Optional[int]) -> TradeRecord:
         ctx, spec, s = self.ctx, self.ctx.contract, self.ctx.settings
         d = sig.direction
-        t = TradeRecord(new_trade_id(), ctx.symbol, ctx.mode, d, pattern=sig.pattern)
+        t = TradeRecord(new_trade_id(), ctx.symbol, ctx.mode, d, pattern=sig.pattern,
+                        created_ts=ctx.now())
         t.validation_fingerprint = s.fingerprint(spec.essentials())
         t.market_environment = s.binance_env
         ctx.save(t)
@@ -206,13 +207,14 @@ class EntryManager:
         ctx = self.ctx
         t.qty_initial = t.qty_open = str(qty)
         t.entry_avg_price = float(avg) if avg else None
-        t.opened_at = ctx.now()
+        t.opened_at = fill_ms / 1000 if fill_ms else ctx.now()
         t.entry_fill_time_ms = int(fill_ms)
         ctx.transition(t, ENTRY_FILLED, f"{'부분 ' if partial else ''}체결 {qty}계약 @ {avg}")
         if t.signal_id:
             ctx.db.update_signal(t.signal_id, "entered", "filled", t.trade_id)
         side = "LONG" if t.direction > 0 else "SHORT"
         ctx.notify("entry", f"{side} 진입 [{t.trade_id}] {qty}계약 @ {avg}\n"
+                            f"{ctx.contract_value(qty, avg)}\n"
                             f"손절 {t.stop_price} · 목표 {t.targets or '추적'}"
                             + ("\n(부분 체결 - 실제 체결 수량으로 진행)" if partial else ""))
 

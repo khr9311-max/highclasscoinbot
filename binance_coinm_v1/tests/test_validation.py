@@ -112,7 +112,7 @@ def test_live_gate_uses_validation_gate(db):
 def test_paper_sample_is_out_of_sample_only(db):
     base = {"symbol": "BTCUSD_PERP", "mode": "paper", "direction": 1, "state": "CLOSED",
             "entry_avg_price": 80000.0, "equity_at_entry_btc": 0.01, "closed_at": NOW,
-            "created_at": NOW, "accounting": {"net_pnl_btc": 0.0001},
+            "created_at": NOW, "accounting": {"net_pnl_btc": 0.0001, "accounting_complete": True},
             "validation_fingerprint": Settings.build().fingerprint(ESS), "market_environment": "live"}
     db.upsert_position(dict(base, trade_id="a" * 10, signal={"close_time": NOW - 100}))
     db.upsert_position(dict(base, trade_id="b" * 10, signal={"close_time": NOW - 10 ** 7}))

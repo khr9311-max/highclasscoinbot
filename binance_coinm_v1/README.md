@@ -4,17 +4,28 @@ BTCUSD 무기한(BTCUSD_PERP) · BTC 증거금 · BTC 회계 · 격리 · 원웨
 1시간봉 신호 / 4시간봉 존 · Trendy Kangaroo · 돌파 진입 · Ladder + Trailing 청산.
 **기본 실행은 종이 매매(paper)** 이며, 실거래 주문은 기본적으로 막혀 있다.
 
-저장소 루트의 업비트 현물 봇과 **완전히 분리된 패키지**다. 루트의 코드·DB·`.env`·실행
-파일을 읽거나 바꾸지 않는다. 가격행동 규칙만 `strategy/price_action.py` 로 복사했고,
+이 저장소의 운영 대상은 **Binance COIN-M 봇 하나**다. 운영 설정은 이 폴더의 `.env`에
+모으고, 루트의 `.env`와 `main.py`는 기존 Upbit용 참고 파일로 구분한다.
+Binance 런타임은 독립된 코드·DB·설정을 사용한다. 가격행동 규칙은 `strategy/price_action.py`로 복사했고,
 원본과 결과가 같은지는 테스트가 매번 확인한다.
 
 > **현재 결론 (2026-09-24):** Binance COIN-M BTCUSD_PERP 6년 백테스트에서 기본 전략은
 > 비용 후 음수(평균 −0.097%/거래, PF 0.70, DSR 0.014)다. 검증 게이트가 닫혀 있으므로
 > 실거래는 열리지 않는다. 자세한 수치는 [백테스트 결과](#백테스트-결과-2026-09-24).
 
+> **BTC 수량 증가 연구:** 목표는 비용을 뺀 BTC 순자산 증가다. 새 전략 6개를 비교했고,
+> 4h EMA20/80이 추가 연구 후보였으나 소액 계정 검증 기준 통과 후보는 없었다.
+> 0.007 BTC의 최근 약 21개월 결과는 +1.73%, 비용 두 배에서는 +0.30%였다.
+> 조건·전체 비교·한계는 [전략 연구 기록](STRATEGY_RESEARCH_2026-09-24.md)을 참고한다.
+
+> **범위 확장 연구:** 다른 코인 선물·2/6/12시간 및 일봉·상위봉 필터·BTC 표시 현물·옵션을
+> 추가 조사했다. BTC 순자산으로 공통 평가했으며 새 운영 승인 전략은 없다.
+> 수치와 판단은 [확장 연구 보고서](EXPANDED_RESEARCH_2026-09-24.md)에 정리했다.
+
 > **추가 검토 (2026-09-24):** 주문 정리 실패 시 종료 보류, 재시작 후 TP 중복 청산 방지,
 > 고아 포지션 손절 보호, 검증 리포트·종이매매 지문 확인, 시세별 지연 검사, 필수 작업 장애
-> 감시를 보강했다. 테스트 **235개 통과**, 저장된 6년 데이터 재실행에서도 음수 결과가
+> 감시를 보강했다. 2차 재검증으로 이력 페이지네이션·회계 확정 여부·paper 디스크 복원·
+> 다중 실행 차단을 추가했다. 실시간 원화 알림·연구 모듈 검증까지 **346개 테스트 통과**, 저장된 6년 데이터 재실행에서도 기본 전략의 음수 결과가
 > 재현됐다. 수정 내역·남은 한계는 [검토 기록](REVIEW_2026-09-24.md)을 참고한다.
 > 전략/검증 버전이 바뀌었으므로 이전 리포트는 재검증해야 하며, 지문이 없는 과거
 > 종이매매 기록은 검증 표본에 포함하지 않는다.
@@ -27,7 +38,6 @@ BTCUSD 무기한(BTCUSD_PERP) · BTC 증거금 · BTC 회계 · 격리 · 원웨
 
 ```bash
 pip install -r binance_coinm_v1/requirements.txt       # 이미 설치돼 있으면 생략
-copy binance_coinm_v1\.env.example binance_coinm_v1\.env   # 필요할 때만 (없어도 paper 로 돈다)
 
 python -m binance_coinm_v1 check                 # 공개 API·서버 시간·계약 사양 (키 불필요)
 python -m binance_coinm_v1 check --private       # + 계정·잔고·포지션·미체결 (읽기 전용, 키 필요)
@@ -37,9 +47,37 @@ python -m binance_coinm_v1 backtest              # 과거 데이터 증분 다�
 python -m binance_coinm_v1 validate              # 백테스트 + 표본 외 종이매매 -> 검증 게이트
 python -m binance_coinm_v1 status                # 현재 거래·최근 신호·스냅샷
 python -m binance_coinm_v1 gate                  # 실거래 게이트 상태와 닫힌 이유
+python -m binance_coinm_v1.backtest.research      # 고정 후보 6개 오프라인 비교 (.env 미사용)
 
-cd binance_coinm_v1 && python -m pytest          # 테스트 (네트워크 차단, 실주문 불가)
+python -m pytest binance_coinm_v1/tests         # 테스트 (네트워크 차단, 실주문 불가)
 ```
+
+PowerShell에서는 저장소 루트의 `.\run_binance.ps1 run`으로도 실행할 수 있다.
+설정 파일이 없을 때만 아래 명령으로 만든다. 이미 작성한 `.env`를 덮어쓰지 않는다.
+
+```powershell
+if (-not (Test-Path -LiteralPath binance_coinm_v1/.env)) {
+    Copy-Item -LiteralPath binance_coinm_v1/.env.example -Destination binance_coinm_v1/.env
+}
+```
+
+프로세스 환경변수는 전용 `.env`보다 우선한다. 같은 DB에 두 번째 봇이 접근하면
+OS 파일 잠금으로 실행을 차단한다. 잠금 파일은 정상 종료·강제 종료 후에도 남을 수
+있으며, 파일의 존재가 아니라 OS 잠금 획득 여부로 판단하므로 삭제할 필요가 없다.
+paper 주문·취소·체결·펀딩은 응답/이벤트 전달 전에 계좌 상태를 DB에 저장한다.
+회계 조회 실패·다른 자산의 수수료는 순손익을 `미확정`으로 표시하고 검증 표본에서 제외한다.
+과거 펀딩의 환산가격을 구하지 못하면 BTC 손익만 계산하며 USD/KRW는 미확정이다.
+
+텔레그램의 진입·TP·손절 알림에는 계약 명목가치를 BTC와 원화로 함께 적는다.
+계약 명목가치(BTC) = 계약 수 × 계약 크기(USD) ÷ 체결가,
+원화 표시 = 계약 수 × 계약 크기(USD) × USD/KRW다.
+종료 손익은 각 체결·펀딩 시점에 계산한 USD 순손익에 USD/KRW를 곱한다.
+시작 알림에는 계좌 평가 BTC와 원화값을 적는다. 현재 전용 `.env`는
+`USD_KRW_SOURCE=upbit_usdt`이며 공개 USDT/KRW 시세를 약 30초마다 갱신한다.
+이는 **USDT를 USD와 비슷한 가치로 보는 참고 시세**이며 은행의 USD/KRW 고시환율과
+다를 수 있다. 텔레그램에는 `USDT/KRW`라고 출처를 표시한다. 시세가 2분 넘게
+오래됐거나 조회가 실패해 사용할 수 없으면 `USD_KRW_RATE`의 설정 환율(현재
+1,390원)을 쓰고 대체값이라고 표시한다. 환산액은 매매 판단에 사용하지 않는다.
 
 상태·로그·캐시는 `binance_coinm_v1/state/` (git 제외):
 `coinm_v1.sqlite3`, `logs/coinm_v1.log`, `cache/*.csv`, `backtest_report.json`,
@@ -82,7 +120,7 @@ binance_coinm_v1/
   storage/                    SQLite (orders·fills·positions·signals·...) · 비밀값 마스킹
   notifications/telegram.py   알림 전용 (큐 + 별도 작업자, 실패해도 매매 계속)
   runtime/                    봇 런타임·계좌 스냅샷·로깅
-  tests/                      235개 (네트워크 차단)
+  tests/                      346개 (네트워크 차단)
 ```
 
 흐름:
@@ -254,7 +292,7 @@ BTCUSD_PERP 1h 53,642봉·4h 13,411봉·마크 1h 53,641봉(공백 0), 펀딩 6,
 
 ## 테스트
 
-`cd binance_coinm_v1 && python -m pytest` — **235개 통과**. 외부 DNS·소켓 연결을 막고,
+`python -m pytest binance_coinm_v1/tests` — **290개 통과**. 외부 DNS·소켓 연결을 막고,
 실제 HTTP/웹소켓/텔레그램 전송 객체 생성을 금지한 상태로 돈다 (실주문 불가).
 
 | 파일 | 내용 |
@@ -272,6 +310,8 @@ BTCUSD_PERP 1h 53,642봉·4h 13,411봉·마크 1h 53,641봉(공백 0), 펀딩 6,
 | test_live_safety | LiveOrderGate 전 경로, 레버리지 자동 상향 금지 |
 | test_backtest / test_validation / test_runtime | 시뮬레이터 규칙·지표·DSR/PBO, 검증 게이트, 런타임·텔레그램 장애 격리 |
 | test_review_regressions | 취소 실패·TP 누락/부분 체결·고아 손절·시세 지연·설정/리포트 오류·작업 장애 등 37개 회귀 테스트 |
+| test_revalidation | 이력 페이지네이션·미확정 회계·6개 시점 프로세스 강제 종료·DB 복원·중복 실행 차단·비정상 입력 등 49개 추가 테스트 |
+| test_notification_krw | 진입·TP·손절·종료·펀딩·시작 알림의 원화 환산과 환율 표기 |
 
 ## 아직 없는 것 / 한계
 
@@ -289,8 +329,9 @@ BTCUSD_PERP 1h 53,642봉·4h 13,411봉·마크 1h 53,641봉(공백 0), 펀딩 6,
 - 백테스트 시장가는 전량 체결 가정 (소량이라 현실적이지만 급변 시 슬리피지는 더 클 수 있다).
 - 백테스트는 1h/4h, `ENTRY_TRIGGER_TYPE=CONTRACT_PRICE`, `STOP_PRICE_PROTECT=false`를
   지원한다. 다른 설정은 명시적으로 거부한다. 일일 신규 진입 손실 한도도 시뮬레이션한다.
-- 오프라인 동안 발생한 펀딩의 USD 환산은 수집 시점 가격을 사용하므로 추정치다.
-  BTC 펀딩 금액과 구분해야 한다. 추가 회계·장애 복구 검증 항목은 검토 기록에 정리했다.
+- 과거 펀딩의 사건 시점 마크가격이 없으면 USD/KRW는 미확정으로 남긴다.
+  BTC 이력 조회 실패·다른 자산의 수수료·오래 중단된 paper의 추정 펀딩도 검증 표본에서
+  제외한다. 종료된 미확정 거래의 자동 재대사 등 남은 항목은 검토 기록에 정리했다.
 - 워치독·서버 배포 스크립트 없음 (로컬 실행 기준).
 
 ## 실거래로 가려면

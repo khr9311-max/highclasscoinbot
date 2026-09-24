@@ -162,12 +162,15 @@ def cmd_status() -> int:
                  f"qty {t['qty_open']} @ {t.get('entry_avg_price')} 손절 {t.get('stop_price')} "
                  f"목표 {t.get('targets')}")
         closed = db.closed_positions(mode)
-        net = sum((t.get("accounting") or {}).get("net_pnl_btc", 0.0) for t in closed)
-        _out(f"종료 거래 {len(closed)} · 순손익 합계 {net:+.8f} BTC")
+        values = [(t.get("accounting") or {}).get("net_pnl_btc") for t in closed]
+        net = sum(v for v in values if v is not None)
+        _out(f"종료 거래 {len(closed)} · 확인된 순손익 합계 {net:+.8f} BTC · 미확정 {values.count(None)}건")
         for t in closed[-5:]:
             a = t.get("accounting") or {}
-            _out(f"  [{t['trade_id']}] {t.get('close_reason')} 순 {a.get('net_pnl_btc', 0):+.8f} BTC "
-                 f"({a.get('net_pnl_usd', 0):+.2f} USD) 종료 {kst(t['closed_at']) if t.get('closed_at') else '-'}")
+            btc = f"{a['net_pnl_btc']:+.8f}" if a.get('net_pnl_btc') is not None else "미확정"
+            usd = f"{a['net_pnl_usd']:+.2f}" if a.get('net_pnl_usd') is not None else "미확정"
+            _out(f"  [{t['trade_id']}] {t.get('close_reason')} 순 {btc} BTC "
+                 f"({usd} USD) 종료 {kst(t['closed_at']) if t.get('closed_at') else '-'}")
         snap = db.latest_account_snapshot(mode)
         if snap:
             _out(f"최근 스냅샷 {kst(snap['ts'])}: equity {snap['equity_btc']:.8f} BTC "

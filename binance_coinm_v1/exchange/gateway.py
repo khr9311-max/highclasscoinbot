@@ -76,6 +76,10 @@ class ExchangeGateway(abc.ABC):
     async def get_income(self, symbol: str, income_type: Optional[str] = None,
                          start_ms: Optional[int] = None) -> List[Dict[str, Any]]: ...
 
+    async def funding_marks(self, symbol: str, start_ms: int, end_ms: int) -> Dict[int, float]:
+        """Historical conversion prices, if the venue provides them."""
+        return {}
+
     # ---- 주문 변경 (실거래는 LiveOrderGate 통과 필수) ----
     @abc.abstractmethod
     async def place_order(self, req: OrderRequest) -> OrderState:

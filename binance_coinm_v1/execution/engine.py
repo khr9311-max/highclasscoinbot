@@ -173,7 +173,7 @@ class Engine:
                                           {"trade_id": t.trade_id, "order": ev.client_algo_id,
                                            "status": ev.status, "reason": ev.reject_reason})
                     await self.protection.ensure_stop(t)
-                elif ev.status in ("TRIGGERED", "FINISHED"):
+                elif ev.status == "FINISHED":
                     await self._check_flat(t, self._stop_reason(t))
             elif p and p[1] == "TP" and ev.status == "FINISHED" and ev.actual_qty > 0:
                 # 발동된 TP 의 체결 이벤트가 ALGO_UPDATE 보다 먼저 와서 연결을 못 했어도
@@ -237,7 +237,8 @@ class Engine:
                 t.logic = lg.to_dict()
                 if new is not None:
                     await self.protection.move_stop(t, new, "split_breakeven")
-            ctx.notify("tp", f"TP{level + 1} 체결 [{t.trade_id}] {qty}계약 @ {avg}")
+            ctx.notify("tp", f"TP{level + 1} 체결 [{t.trade_id}] {qty}계약 @ {avg}\n"
+                             f"{ctx.contract_value(qty, avg)}")
         await self._check_flat(t, f"tp{level + 1}_final")
         if t.state != CLOSED:
             self.protection.refresh_state(t)
@@ -258,7 +259,8 @@ class Engine:
             else:
                 await self._check_flat(t, f"tp{level + 1}_final")
         elif role == "SL":
-            ctx.notify("stop", f"손절 체결 [{t.trade_id}] {ev.last_qty}계약 @ {ev.last_price}")
+            ctx.notify("stop", f"손절 체결 [{t.trade_id}] {ev.last_qty}계약 @ {ev.last_price}\n"
+                               f"{ctx.contract_value(ev.last_qty, ev.last_price)}")
             await self._check_flat(t, self._stop_reason(t))
         elif role in ("EN", "EX", "EM"):
             ctx.save(t)                      # 진입·청산 흐름이 직접 확인한다
@@ -299,7 +301,7 @@ class Engine:
             m.ts_ms = max(m.ts_ms, int(ts_ms))
         m.updated_mono = self.ctx.mono()
         t = self.trade
-        if t is None or t.state != ENTRY_PENDING:
+        if t is None or t.state != ENTRY_PENDING or not self.trading_allowed:
             return
         async with self.lock:
             await self._drain_locked()

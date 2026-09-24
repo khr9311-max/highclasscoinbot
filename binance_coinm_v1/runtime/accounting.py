@@ -8,13 +8,15 @@
   equity_usd            : equity_btc x 지수가(index price - 현물 기준 BTC 가치)
   equity_krw            : equity_usd x USD/KRW (표시용)
 
-USD/KRW 는 설정 고정값(기본) 또는 업비트 KRW-USDT 시세(공개 API, 키 불필요)를 쓴다.
+원화 환산은 설정 고정값(기본) 또는 업비트 USDT/KRW 참고 시세를 쓴다.
+USDT/KRW 사용 시 1 USDT ≈ 1 USD 가정이며 실제 외환 USD/KRW 고시환율은 아니다.
 표시용이며 매매 판단에는 쓰지 않는다.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 from typing import Any, Dict, Optional
@@ -26,32 +28,54 @@ logger = logging.getLogger(__name__)
 
 
 class FxProvider:
-    def __init__(self, source: str = "fixed", fixed_rate: float = 1390.0, ttl: float = 600.0):
+    def __init__(self, source: str = "fixed", fixed_rate: float = 1390.0, ttl: float = 30.0):
         self.source = source
         self.fixed_rate = float(fixed_rate)
         self.ttl = ttl
         self._cached: Optional[float] = None
         self._at = 0.0
+        self._quote_at = 0.0
+        self._last_attempt = 0.0
+        self.last_source = "fixed" if source == "fixed" else "fixed_fallback"
+
+    async def _fetch_quote(self) -> tuple[float, float]:
+        import aiohttp
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+            async with session.get("https://api.upbit.com/v1/ticker",
+                                   params={"markets": "KRW-USDT"}) as response:
+                response.raise_for_status()
+                data = await response.json()
+        row = data[0]
+        if row.get("market") != "KRW-USDT":
+            raise ValueError("KRW-USDT ticker missing")
+        return float(row["trade_price"]), int(row["timestamp"]) / 1000.0
 
     async def usd_krw(self) -> float:
         if self.source != "upbit_usdt":
+            self.last_source = "fixed"
             return self.fixed_rate
-        if self._cached and time.time() - self._at < self.ttl:
+        now = time.time()
+        cached_fresh = self._cached is not None and 0 <= now - self._quote_at <= 120
+        if cached_fresh and now - self._at < self.ttl:
+            self.last_source = "upbit_usdt"
             return self._cached
-        if os.environ.get("COINM_V1_TEST_MODE") == "1":
-            return self.fixed_rate
-        try:
-            import aiohttp
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as s:
-                async with s.get("https://api.upbit.com/v1/ticker", params={"markets": "KRW-USDT"}) as r:
-                    data = await r.json()
-            rate = float(data[0]["trade_price"])
-            if 500 < rate < 5000:
-                self._cached, self._at = rate, time.time()
+        if now - self._last_attempt >= self.ttl and os.environ.get("COINM_V1_TEST_MODE") != "1":
+            self._last_attempt = now
+            try:
+                rate, quote_at = await self._fetch_quote()
+                if not (math.isfinite(rate) and 500 < rate < 5000 and
+                        0 <= now - quote_at <= 120):
+                    raise ValueError("stale or invalid KRW-USDT ticker")
+                self._cached, self._at, self._quote_at = rate, now, quote_at
+                self.last_source = "upbit_usdt"
                 return rate
-        except Exception as e:
-            logger.debug("USD/KRW 조회 실패 - 고정값 사용: %s", type(e).__name__)
-        return self._cached or self.fixed_rate
+            except Exception as e:
+                logger.debug("USDT/KRW 조회 실패 - 설정 환율 사용: %s", type(e).__name__)
+        if cached_fresh:
+            self.last_source = "upbit_usdt_cached"
+            return self._cached
+        self.last_source = "fixed_fallback"
+        return self.fixed_rate
 
 
 def build_snapshot(account: AccountInfo, position: Optional[PositionInfo], contract: ContractSpec,

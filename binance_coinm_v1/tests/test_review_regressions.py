@@ -187,7 +187,7 @@ def test_paper_samples_require_same_configuration_and_live_market(db):
     fp = Settings.build().fingerprint(ESS)
     base = dict(symbol="BTCUSD_PERP", mode="paper", direction=1, state="CLOSED",
                 entry_avg_price=80000, equity_at_entry_btc=0.01, closed_at=NOW,
-                signal={"close_time": NOW - 1}, accounting={"net_pnl_btc": 0.0001},
+                signal={"close_time": NOW - 1}, accounting={"net_pnl_btc": 0.0001, "accounting_complete": True},
                 validation_fingerprint=fp, market_environment="live")
     for tid, fields in (("valid", {}), ("legacy", {"validation_fingerprint": None}),
                         ("changed", {"validation_fingerprint": "different"}),

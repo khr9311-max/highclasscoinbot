@@ -150,10 +150,13 @@ class ExitManager:
         acc = ctx.recompute_accounting(t)
         ctx.transition(t, CLOSED, t.close_reason or "closed")
         side = "LONG" if t.direction > 0 else "SHORT"
+        btc = f"{acc['net_pnl_btc']:+.8f}" if acc['net_pnl_btc'] is not None else "미확정"
+        usd = f"{acc['net_pnl_usd']:+.2f}" if acc['net_pnl_usd'] is not None else "미확정"
+        krw = f"{acc['net_pnl_krw']:+,.0f}" if acc['net_pnl_krw'] is not None else "미확정"
         ctx.notify("close", f"{side} 종료 [{t.trade_id}] 사유 {t.close_reason}\n"
-                            f"순손익 {acc['net_pnl_btc']:+.8f} BTC (실현 {acc['realized_pnl_btc']:+.8f}, "
+                            f"순손익 {btc} BTC (실현 {acc['realized_pnl_btc']:+.8f}, "
                             f"수수료 {acc['trading_fee_btc']:.8f}, 펀딩 {acc['funding_fee_btc']:+.8f})\n"
-                            f"= {acc['net_pnl_usd']:+.2f} USD / {acc['net_pnl_krw']:+,.0f} KRW")
+                            f"= {usd} USD / {krw} KRW ({ctx.krw_rate_label()})")
         return True
 
     async def partial_now(self, t: TradeRecord, level: int, qty: Decimal, reason: str) -> None:

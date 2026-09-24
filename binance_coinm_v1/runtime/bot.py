@@ -40,6 +40,7 @@ from ..storage.db import Database
 from ..storage.redact import GLOBAL_REDACTOR
 from ..validation.gate import ValidationGate
 from .accounting import FxProvider, build_snapshot
+from .instance_lock import InstanceLock
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,7 @@ class Bot:
         self._bar_evt = asyncio.Event()
         self._gate_open_last: Optional[bool] = None
         self._stale_notified = False
+        self._instance_lock = InstanceLock(settings.db_path + ".lock")
         self.stats: Dict[str, int] = {"market_events": 0, "bars": 0, "reconciles": 0}
 
     @property
@@ -79,6 +81,7 @@ class Bot:
     async def setup(self) -> Dict[str, Any]:
         s = self.settings
         GLOBAL_REDACTOR.add(*s.secrets())
+        self._instance_lock.acquire()
         self.db = Database(s.db_path)
         rest_url, self.ws_base = endpoints(s.binance_env)
         self.public = BinanceRestClient(rest_url, transport=self.transport, recv_window=s.recv_window_ms,
@@ -103,6 +106,7 @@ class Bot:
                 self.gateway.load_state(st)
                 logger.info("종이 계좌 복원: 지갑 %.8f BTC, 포지션 %s", self.gateway.wallet,
                             self.gateway.pos_qty)
+            self.gateway.checkpoint = lambda state: self.db.kv_set("paper:paper_state", state)
         else:
             if not s.has_api_keys:
                 raise ConfigError(f"EXECUTION_MODE={s.execution_mode} 는 API 키가 필요합니다")
@@ -124,12 +128,22 @@ class Bot:
         rep = await self.engine.startup()
         gate = self.live_gate.status()
         self._gate_open_last = gate["open"]
+        await self._refresh_fx()
+        equity = rep.get("equity_btc")
+        btc_usd = self.engine.ctx.market.index or self.engine.ctx.market.mark
+        value_line = ""
+        if equity is not None and btc_usd and math.isfinite(float(equity)) and \
+                math.isfinite(float(btc_usd)) and float(btc_usd) > 0:
+            value_line = (f"\n계좌 평가 {float(equity):.8f} BTC "
+                          f"(약 {float(equity) * float(btc_usd) * self.engine.ctx.usd_krw:,.0f}원; "
+                          f"BTC 기준 {float(btc_usd):,.1f} USD × "
+                          f"{self.engine.ctx.krw_rate_label()})")
         self.notifier.notify("startup", (
             f"모드 {s.execution_mode} ({s.binance_env}) · {s.symbol}\n"
             f"계약 contractSize={self.spec.contract_size} tick={self.spec.tick_size} "
             f"step={self.spec.step_size} minQty={self.spec.min_qty} 증거금 {self.spec.margin_asset}\n"
             f"레버리지 {s.leverage}x 격리 · 위험 {s.risk_per_trade_pct}%/거래 · 일손실 한도 "
-            f"{s.max_daily_loss_pct}%\n신규 진입 {'허용' if rep.get('trading_allowed') else '차단'} · "
+            f"{s.max_daily_loss_pct}%{value_line}\n신규 진입 {'허용' if rep.get('trading_allowed') else '차단'} · "
             f"실거래 게이트 {'열림' if gate['open'] else '닫힘'}"
             + ("" if gate["open"] else f" ({'; '.join(gate['reasons'])[:200]})")))
         self.db.log_event(s.execution_mode, "startup", {"recovery": rep, "gate": gate,
@@ -266,6 +280,7 @@ class Bot:
                 pass
             now = self.clock()
             try:
+                await self._refresh_fx()
                 self.db.kv_set(f"{mode}:heartbeat", now)
                 if self.paper:
                     self.db.kv_set("paper:paper_state", self.gateway.to_state())
@@ -305,12 +320,18 @@ class Bot:
             except Exception as e:
                 logger.exception("주기 작업 실패: %s", e)
 
+    async def _refresh_fx(self) -> None:
+        rate = await self.fx.usd_krw()
+        if self.engine is not None:
+            self.engine.ctx.usd_krw = rate
+            self.engine.ctx.fx_rate_source = self.fx.last_source
+
     async def snapshot(self) -> Dict[str, Any]:
         acct = await self.gateway.get_account()
         pos = await self.gateway.get_position(self.settings.symbol)
         m = self.engine.ctx.market
-        rate = await self.fx.usd_krw()
-        self.engine.ctx.usd_krw = rate
+        await self._refresh_fx()
+        rate = self.engine.ctx.usd_krw
         snap = build_snapshot(acct, pos, self.spec, m.mark, m.index, rate, self.settings.execution_mode)
         self.db.insert_account_snapshot(snap, self.settings.execution_mode)
         # 일일 손실 한도의 '하루 시작 equity' 를 진입 시도 전에 미리 잡아 둔다 (UTC 날짜 기준)
@@ -365,6 +386,12 @@ class Bot:
         raise RuntimeError(self.engine.halts["runtime"])
 
     async def shutdown(self, tasks=()) -> None:
+        try:
+            await self._shutdown(tasks)
+        finally:
+            self._instance_lock.release()
+
+    async def _shutdown(self, tasks=()) -> None:
         self.stop_event.set()
         for t in tasks:
             t.cancel()

@@ -50,7 +50,7 @@ def paper_trade_returns(db: Any, after_ts: float, symbol: str,
         eq = _number(t.get("equity_at_entry_btc")) or 0.0
         acc = t.get("accounting") or {}
         net = _number(acc.get("net_pnl_btc"))
-        if eq <= 0 or net is None:
+        if eq <= 0 or net is None or acc.get("accounting_complete") is not True:
             continue
         out.append({"trade_id": t["trade_id"], "net_btc": net,
                     "ret": net / eq, "fingerprint": fingerprint, "market_environment": "live",

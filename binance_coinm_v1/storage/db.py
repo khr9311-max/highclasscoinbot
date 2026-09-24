@@ -291,14 +291,24 @@ class Database:
              float(f.get("commission") or 0.0), f.get("commission_asset"),
              int(bool(f.get("is_maker"))), int(f.get("time_ms") or 0), f.get("source"),
              f["mode"], time.time()))
-        return cur.rowcount > 0
+        if cur.rowcount > 0:
+            return True
+        if f.get("trade_id"):
+            cur = self.conn.execute(
+                "UPDATE fills SET trade_id=?, client_order_id=COALESCE(client_order_id, ?) "
+                "WHERE symbol=? AND exchange_trade_id=? AND mode=? AND trade_id IS NULL",
+                (f["trade_id"], f.get("client_order_id"), f["symbol"],
+                 str(f["exchange_trade_id"]), f["mode"]))
+            return cur.rowcount > 0
+        return False
 
     def fills_for_trade(self, trade_id: str) -> List[Dict[str, Any]]:
         return [dict(r) for r in self.conn.execute(
             "SELECT * FROM fills WHERE trade_id=? ORDER BY time_ms, id", (trade_id,)).fetchall()]
 
     def assign_fill_trade(self, fill_row_id: int, trade_id: str) -> None:
-        self.conn.execute("UPDATE fills SET trade_id=? WHERE id=?", (trade_id, fill_row_id))
+        self.conn.execute("UPDATE fills SET trade_id=? WHERE id=? AND trade_id IS NULL",
+                          (trade_id, fill_row_id))
 
     def unassigned_fills(self, mode: str, symbol: str) -> List[Dict[str, Any]]:
         return [dict(r) for r in self.conn.execute(
@@ -431,9 +441,19 @@ class Database:
 
     def insert_funding_event(self, ev: Dict[str, Any], mode: str) -> bool:
         cur = self.conn.execute(
-            "INSERT OR IGNORE INTO funding_events (symbol, funding_time_ms, funding_rate, "
+            "INSERT INTO funding_events (symbol, funding_time_ms, funding_rate, "
             "mark_price, position_qty, funding_fee_btc, funding_fee_usd, trade_id, source, "
-            "mode, recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "mode, recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(symbol, funding_time_ms, source, mode) DO UPDATE SET "
+            "trade_id=COALESCE(funding_events.trade_id, excluded.trade_id), "
+            "mark_price=excluded.mark_price, funding_fee_usd=excluded.funding_fee_usd, "
+            "funding_fee_btc=excluded.funding_fee_btc "
+            "WHERE (funding_events.trade_id IS NULL OR excluded.trade_id IS NULL "
+            "OR funding_events.trade_id=excluded.trade_id) AND "
+            "((funding_events.trade_id IS NULL AND excluded.trade_id IS NOT NULL) OR "
+            "funding_events.mark_price IS NOT excluded.mark_price OR "
+            "funding_events.funding_fee_usd IS NOT excluded.funding_fee_usd OR "
+            "funding_events.funding_fee_btc IS NOT excluded.funding_fee_btc)",
             (ev["symbol"], int(ev["funding_time_ms"]), ev.get("funding_rate"),
              ev.get("mark_price"), ev.get("position_qty"), ev.get("funding_fee_btc"),
              ev.get("funding_fee_usd"), ev.get("trade_id"), ev["source"], mode, time.time()))

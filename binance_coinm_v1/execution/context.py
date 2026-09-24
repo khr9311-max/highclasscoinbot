@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from dataclasses import dataclass
 from decimal import Decimal
@@ -92,6 +93,7 @@ class ExecutionContext:
         self.mmr: Optional[float] = None
         self.cum_btc = 0.0
         self.usd_krw = settings.usd_krw_rate
+        self.fx_rate_source = "fixed" if settings.usd_krw_source == "fixed" else "fixed_fallback"
 
     # ------------------------------------------------------------------ 기록
     def now(self) -> float:
@@ -99,6 +101,29 @@ class ExecutionContext:
 
     def now_ms(self) -> int:
         return int(self.clock() * 1000)
+
+    def krw_rate_label(self) -> str:
+        if self.fx_rate_source in ("upbit_usdt", "upbit_usdt_cached"):
+            source = "공개 참고 시세" if self.fx_rate_source == "upbit_usdt" else "최근 공개 참고 시세"
+            return f"USDT/KRW {self.usd_krw:,.0f}원 ({source}, 1 USDT≈1 USD 가정)"
+        source = "설정 환율" if self.fx_rate_source == "fixed" else "시세 조회 불가·설정 환율"
+        return f"USD/KRW {self.usd_krw:,.0f}원 ({source})"
+
+    def contract_value(self, qty: Any, price: Any) -> str:
+        """Executed contract notional, shown as BTC and indicative KRW."""
+        try:
+            px = float(price)
+            quantity = Decimal(str(qty))
+            rate = float(self.usd_krw)
+            if not (math.isfinite(px) and px > 0 and math.isfinite(rate) and rate > 0
+                    and quantity > 0):
+                raise ValueError("invalid conversion input")
+            usd = float(quantity * self.contract.contract_size)
+            btc = usd / px
+            return (f"계약 명목가치 {btc:.8f} BTC (약 {usd * rate:,.0f}원; "
+                    f"{self.krw_rate_label()})")
+        except (ValueError, TypeError, ArithmeticError):
+            return "계약 명목가치 원화 환산 미확정"
 
     def save(self, t: TradeRecord) -> None:
         d = t.to_dict()
@@ -201,7 +226,7 @@ class ExecutionContext:
                 last_err = e
             await self.sleep(delay)
             delay = min(delay * 2, 4.0)
-        if not_found >= 2 or (not_found >= 1 and last_err is None):
+        if not_found >= 1 and last_err is None:
             return OrderState.not_found(client_id, self.symbol, is_algo)
         raise OrderStatusUnknown(client_id, last_err or RuntimeError("조회 실패"))
 
@@ -253,6 +278,11 @@ class ExecutionContext:
 
     def record_fill(self, f: Fill, source: str, active: Optional[TradeRecord]) -> Optional[str]:
         """새 체결이면 귀속된 trade_id, 중복이면 None."""
+        if f.symbol != self.symbol:
+            return None
+        if active is not None and f.time_ms < (active.entry_fill_time_ms or
+                                               int((active.opened_at or active.created_ts) * 1000)):
+            active = None
         tid = self.attribute(f.client_id, f.order_id, active)
         inserted = self.db.insert_fill({
             "symbol": f.symbol, "exchange_trade_id": f.trade_id, "exchange_order_id": f.order_id,
@@ -269,7 +299,11 @@ class ExecutionContext:
             fills = await self.gw.get_user_trades(self.symbol, start_ms=start)
         except ExchangeError as e:
             logger.warning("체결 동기화 실패: %s", e)
+            if "fills_sync" not in t.accounting_errors:
+                t.accounting_errors.append("fills_sync")
             return 0
+        if "fills_sync" in t.accounting_errors:
+            t.accounting_errors.remove("fills_sync")
         n = 0
         for f in fills:
             if not f.client_id:
@@ -286,16 +320,42 @@ class ExecutionContext:
             rows = await self.gw.get_income(self.symbol, "FUNDING_FEE", since_ms)
         except ExchangeError as e:
             logger.warning("펀딩 수집 실패: %s", e)
+            if t is not None and "funding_sync" not in t.accounting_errors:
+                t.accounting_errors.append("funding_sync")
             return 0
-        n = 0
+        if t is not None and "funding_sync" in t.accounting_errors:
+            t.accounting_errors.remove("funding_sync")
+        rows = [r for r in rows if r.get("symbol") == self.symbol]
+        missing = [int(r["time"]) for r in rows if not r.get("markPrice")]
+        marks = {}
+        if missing:
+            try:
+                marks = await self.gw.funding_marks(self.symbol, min(missing), max(missing))
+            except ExchangeError as e:
+                logger.warning("과거 펀딩 환산가격 조회 실패: %s", e)
+        # Income can contain several transactions at the same settlement time.
+        grouped: Dict[int, Dict[str, Any]] = {}
         for r in rows:
+            if r.get("asset") != self.contract.margin_asset:
+                if t is not None and "funding_asset" not in t.accounting_errors:
+                    t.accounting_errors.append("funding_asset")
+                continue
+            ft = int(r["time"])
+            ev = grouped.setdefault(ft, dict(r, income=0.0))
+            ev["income"] += float(r["income"])
+        n = 0
+        for r in grouped.values():
             ft = int(r.get("time") or 0)
             fee = float(r.get("income") or 0.0)
-            mark = self.market.mark or self.market.last or 0.0
+            mark = float(r.get("markPrice") or marks.get(ft) or 0.0)
+            if not math.isfinite(mark) or mark <= 0:
+                mark = 0.0
             tid = None
             if t is not None and t.opened_at and ft >= int(t.opened_at * 1000) - 1000 and \
                     (not t.closed_at or ft <= int(t.closed_at * 1000) + 1000):
                 tid = t.trade_id
+                if r.get("estimated") and "estimated_paper_funding" not in t.accounting_errors:
+                    t.accounting_errors.append("estimated_paper_funding")
             rate = None
             info = str(r.get("info") or "")
             if info.startswith("rate="):
@@ -309,15 +369,30 @@ class ExecutionContext:
                     "funding_fee_btc": fee, "funding_fee_usd": fee * mark if mark else None,
                     "trade_id": tid, "source": "income"}, self.mode):
                 n += 1
+                if tid and self.now_ms() - 300_000 <= ft <= self.now_ms() + 1_000:
+                    krw = f"약 {fee * mark * self.usd_krw:+,.0f}원" if mark else "원화 환산 미확정"
+                    estimate = " (지연 계산 추정)" if r.get("estimated") else ""
+                    self.notify("funding", f"펀딩 정산 [{tid}] {fee:+.8f} BTC{estimate}\n"
+                                f"{krw} · {self.krw_rate_label()}")
         return n
 
-    def recompute_accounting(self, t: TradeRecord) -> Dict[str, float]:
+    def recompute_accounting(self, t: TradeRecord) -> Dict[str, Any]:
         fills = self.db.fills_for_trade(t.trade_id)
         realized = sum(float(f["realized_pnl_btc"] or 0.0) for f in fills)
         fee = sum(float(f["commission"] or 0.0) for f in fills
                   if (f.get("commission_asset") or "BTC") == self.contract.margin_asset)
         realized_usd = sum(float(f["realized_pnl_btc"] or 0.0) * float(f["price"]) for f in fills)
-        fee_usd = sum(float(f["commission"] or 0.0) * float(f["price"]) for f in fills)
+        fee_usd = sum(float(f["commission"] or 0.0) * float(f["price"]) for f in fills
+                      if f.get("commission_asset") == self.contract.margin_asset)
+        errors = list(t.accounting_errors)
+        if any(f.get("commission_asset") != self.contract.margin_asset and f["commission"]
+               for f in fills):
+            errors.append("unconverted_fee_asset")
+        if t.entry_avg_price and t.qty_open_d == 0:
+            opened = sum((Decimal(str(f["qty"])) for f in fills if f["side"] == t.side_open), Decimal(0))
+            closed = sum((Decimal(str(f["qty"])) for f in fills if f["side"] == t.side_close), Decimal(0))
+            if opened != t.qty_initial_d or closed != opened:
+                errors.append("fill_quantity_mismatch")
         funds = self.db.funding_events(self.mode, t.trade_id)
         funding = sum(float(r["funding_fee_btc"] or 0.0) for r in funds)
         funding_usd = sum(float(r["funding_fee_usd"] or 0.0) for r in funds)
@@ -328,14 +403,18 @@ class ExecutionContext:
             unreal = im.pnl_btc(t.direction, t.qty_open_d, self.contract.contract_size,
                                 t.entry_avg_price, mark)
             unreal_usd = unreal * mark
-        net = realized - fee + funding
-        net_usd = realized_usd - fee_usd + funding_usd
+        btc_complete = not errors
+        usd_complete = btc_complete and all(r["funding_fee_usd"] is not None for r in funds)
+        net = realized - fee + funding if btc_complete else None
+        net_usd = realized_usd - fee_usd + funding_usd if usd_complete else None
         acc = {"realized_pnl_btc": realized, "unrealized_pnl_btc": unreal,
                "trading_fee_btc": fee, "funding_fee_btc": funding, "net_pnl_btc": net,
                "realized_pnl_usd": realized_usd, "unrealized_pnl_usd": unreal_usd,
-               "trading_fee_usd": fee_usd, "funding_fee_usd": funding_usd,
-               "net_pnl_usd": net_usd, "net_pnl_krw": net_usd * self.usd_krw,
-               "usd_krw": self.usd_krw}
+               "trading_fee_usd": fee_usd,
+               "funding_fee_usd": funding_usd if all(r["funding_fee_usd"] is not None for r in funds) else None,
+               "net_pnl_usd": net_usd, "net_pnl_krw": net_usd * self.usd_krw if net_usd is not None else None,
+               "usd_krw": self.usd_krw, "accounting_complete": btc_complete,
+               "usd_accounting_complete": usd_complete, "accounting_errors": errors}
         # 거래소 실현손익과 로컬 인버스 계산의 교차 확인 (차이는 기록만)
         if t.entry_avg_price:
             local = 0.0

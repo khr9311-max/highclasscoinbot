@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from decimal import ROUND_DOWN, Decimal
@@ -58,7 +59,8 @@ class PaperGateway(ExchangeGateway):
 
     def __init__(self, spec: ContractSpec, settings: Settings,
                  clock: Callable[[], float] = time.time,
-                 start_equity_btc: Optional[float] = None):
+                 start_equity_btc: Optional[float] = None,
+                 checkpoint: Optional[Callable[[Dict[str, Any]], None]] = None):
         super().__init__()
         self.spec = spec
         self.settings = settings
@@ -90,6 +92,21 @@ class PaperGateway(ExchangeGateway):
         self.faults: List[Fault] = []
         self.partial_next: Optional[float] = None
         self.api_calls: List[str] = []
+        self.checkpoint = checkpoint
+        self._pending_events: List[Dict[str, Any]] = []
+        self.last_ts_ms = self.mark_ts_ms = 0
+
+    def emit(self, event: Dict[str, Any]) -> None:
+        self._pending_events.append(event)
+
+    def _commit(self, force: bool = False) -> None:
+        # Persist the complete exchange-side mutation before exposing its events
+        # or returning an order response. Engine recovery can then query it.
+        if self.checkpoint is not None and (force or self._pending_events):
+            self.checkpoint(self.to_state())
+        events, self._pending_events = self._pending_events, []
+        for event in events:
+            super().emit(event)
 
     # ------------------------------------------------------------------ 시각·주입
     def now_ms(self) -> int:
@@ -121,23 +138,33 @@ class PaperGateway(ExchangeGateway):
                       index: Optional[float] = None, ts_ms: Optional[int] = None,
                       funding_rate: Optional[float] = None,
                       next_funding_ms: Optional[int] = None) -> None:
-        if last is not None:
+        ts = int(ts_ms) if ts_ms is not None else int(self.clock() * 1000)
+        updated = False
+        if last is not None and math.isfinite(last) and last > 0 and ts >= self.last_ts_ms:
             self.last = float(last)
-        if mark is not None:
+            self.last_ts_ms = ts
+            updated = True
+        valid_mark = mark is not None and math.isfinite(mark) and mark > 0 and ts >= self.mark_ts_ms
+        if valid_mark:
             self.mark = float(mark)
-        if index is not None:
-            self.index = float(index)
+            self.mark_ts_ms = ts
+            updated = True
+            if index is not None and math.isfinite(index) and index > 0:
+                self.index = float(index)
+        funding_update = last is None and mark is None and ts >= self.market_ts_ms
+        if not updated and not funding_update:
+            return
         if self.mark is None and self.last is not None:
             self.mark = self.last
-        if ts_ms is not None:
-            self.market_ts_ms = max(self.market_ts_ms, int(ts_ms))
-        if funding_rate is not None:
+        self.market_ts_ms = max(self.market_ts_ms, ts)
+        if (valid_mark or funding_update) and funding_rate is not None and math.isfinite(funding_rate):
             self.funding_rate = float(funding_rate)
-        if next_funding_ms is not None and self.next_funding_ms is None:
+        if (valid_mark or funding_update) and next_funding_ms is not None and self.next_funding_ms is None:
             self.next_funding_ms = int(next_funding_ms)     # 이후는 8시간씩 스스로 진행
         self._process_funding()
         self._check_algos()
         self._check_liquidation()
+        self._commit()
 
     def _price_for(self, working_type: Optional[str]) -> Optional[float]:
         return self.mark if working_type == "MARK_PRICE" else self.last
@@ -278,6 +305,7 @@ class PaperGateway(ExchangeGateway):
             if existing and existing["status"] in ("NEW", "PARTIALLY_FILLED"):
                 raise BinanceAPIError(400, -4116, "ClientOrderId is duplicated.", "/dapi/v1/order")
             state = self._place_market(req)
+        self._commit(force=True)
         exc = self._fault("place", "after", req.client_id, req.purpose)
         if exc is not None:
             raise OrderStatusUnknown(req.client_id, exc)      # 실행됐지만 응답 유실
@@ -308,6 +336,7 @@ class PaperGateway(ExchangeGateway):
                 o["update_ms"] = self.now_ms()
                 self._emit_order(o, "CANCELED")
             state = self._order_state(o)
+        self._commit(force=True)
         exc = self._fault("cancel", "after", client_id)
         if exc is not None:
             raise OrderStatusUnknown(client_id, exc)
@@ -317,11 +346,13 @@ class PaperGateway(ExchangeGateway):
         if self.pos_qty != 0 and leverage > self.leverage:
             raise BinanceAPIError(400, -2027, "Exceeded the maximum allowable position at current leverage.")
         self.leverage = int(leverage)
+        self._commit(force=True)
 
     async def set_margin_type(self, symbol: str, margin_type: str) -> None:
         if self.pos_qty != 0:
             raise BinanceAPIError(400, -4048, "Margin type cannot be changed if there exists position.")
         self.margin_type = margin_type.lower().replace("crossed", "cross")
+        self._commit(force=True)
 
     # ------------------------------------------------------------------ 체결 엔진
     def _next(self, attr: str) -> int:
@@ -391,6 +422,9 @@ class PaperGateway(ExchangeGateway):
             self.pos_margin -= released
             self.pos_qty = pos + side_dir * close_qty
             self.wallet += realized
+            if liquidation:
+                # Insurance liquidation charge belongs in the fill ledger too.
+                fee = min(max(0.0, released + realized), max(0.0, self.wallet))
             remaining -= close_qty
             if self.pos_qty == 0:
                 self.pos_entry = 0.0
@@ -511,12 +545,7 @@ class PaperGateway(ExchangeGateway):
                  "update_ms": self.now_ms(), "working_type": None, "orig_type": "LIQUIDATION",
                  "stop_price": 0.0}
             self.orders[o["client_id"]] = o
-            margin = self.pos_margin
-            realized = im.pnl_btc(d, abs(self.pos_qty), self.spec.contract_size, self.pos_entry, lp)
             self._apply_trade(o, -d, abs(self.pos_qty), lp, maker=False, liquidation=True)
-            # 청산가 손실을 뺀 격리 증거금 잔여분은 보험기금으로 간다 (청산 수수료 성격)
-            remainder = max(0.0, margin + realized)
-            self.wallet -= min(remainder, max(0.0, self.wallet))
 
     def _process_funding(self) -> None:
         if self.next_funding_ms is None:
@@ -528,7 +557,9 @@ class PaperGateway(ExchangeGateway):
                                          self.spec.contract_size, self.mark, self.funding_rate)
                 self.wallet += fee
                 self.income.append({"symbol": self.spec.symbol, "incomeType": "FUNDING_FEE",
-                                    "income": f"{fee:.8f}", "asset": "BTC", "time": ft,
+                                    "income": str(fee), "asset": "BTC", "time": ft,
+                                    "markPrice": self.mark,
+                                    "estimated": self.market_ts_ms - ft > 60_000,
                                     "tranId": self._next("_tid"), "tradeId": "",
                                     "info": f"rate={self.funding_rate}"})
                 self._emit_account("FUNDING_FEE", funding_time=ft, balance_change=fee)
@@ -545,7 +576,7 @@ class PaperGateway(ExchangeGateway):
             "q": str(o["qty"]), "p": "0", "ap": f"{avg:.8f}", "sp": str(o.get("stop_price", 0)),
             "x": exec_type, "X": o["status"], "i": o["order_id"], "l": str(last_qty),
             "z": str(o["executed"]), "L": f"{last_px}", "ma": "BTC", "N": "BTC",
-            "n": f"{fee:.8f}", "T": now, "t": trade_id, "rp": f"{realized:.8f}",
+            "n": repr(fee), "T": now, "t": trade_id, "rp": repr(realized),
             "b": "0", "a": "0", "m": maker, "R": o["reduce_only"],
             "wt": o.get("working_type") or "CONTRACT_PRICE", "ot": o.get("orig_type", o["type"]),
             "ps": "BOTH", "cp": o.get("close_position", False)}})
@@ -590,7 +621,7 @@ class PaperGateway(ExchangeGateway):
             "wallet": self.wallet, "pos_qty": self.pos_qty, "pos_entry": self.pos_entry,
             "pos_margin": self.pos_margin, "leverage": self.leverage, "margin_type": self.margin_type,
             "orders": self.orders, "algos": self.algos,
-            "fills": [f.__dict__ for f in self.fills[-500:]], "income": self.income[-500:],
+            "fills": [f.__dict__ for f in self.fills], "income": self.income,
             "ids": [self._oid, self._tid, self._aid], "funding_rate": self.funding_rate,
             "next_funding_ms": self.next_funding_ms, "market_ts_ms": self.market_ts_ms})
 

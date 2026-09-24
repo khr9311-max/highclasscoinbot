@@ -27,7 +27,7 @@ LIVE_CONFIRMATION_PHRASE = "I_UNDERSTAND_LIVE_TRADING"
 
 # 전략 코드(신호·청산 규칙)가 바뀌면 올린다. 검증 리포트의 설정 지문에 들어가므로
 # 규칙을 바꾸면 옛 검증 결과로는 실거래 게이트가 열리지 않는다.
-STRATEGY_VERSION = "trendy_kangaroo-v1.1"
+STRATEGY_VERSION = "trendy_kangaroo-v1.2"
 
 TRIGGER_TYPES = ("MARK_PRICE", "CONTRACT_PRICE")
 BINANCE_INTERVALS = ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d")

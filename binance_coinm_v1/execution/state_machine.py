@@ -99,7 +99,8 @@ class TradeRecord:
     order_seq: Dict[str, int] = field(default_factory=dict)
     entry_attempts: int = 0
     close_reason: Optional[str] = None
-    accounting: Dict[str, float] = field(default_factory=dict)
+    accounting: Dict[str, Any] = field(default_factory=dict)
+    accounting_errors: List[str] = field(default_factory=list)
     sizing: Dict[str, Any] = field(default_factory=dict)
     adopted: bool = False
     equity_at_entry_btc: Optional[float] = None

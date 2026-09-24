@@ -71,6 +71,12 @@ def _reject(reason: str, steps: Dict[str, Any]) -> SizingResult:
 
 def size_position(inp: SizingInput, contract: ContractSpec) -> SizingResult:
     s: Dict[str, Any] = {}
+    for name, value in vars(inp).items():
+        if value is not None and not math.isfinite(value):
+            return _reject(f"비정상 사이징 입력: {name}", s)
+    if inp.entry_price <= 0 or inp.stop_price <= 0 or inp.leverage <= 0 or \
+            inp.available_btc < 0 or not 0 < inp.risk_fraction <= 1 or inp.taker_fee < 0:
+        return _reject("사이징 입력 범위 오류", s)
     d = inp.direction
     if d not in (1, -1):
         return _reject("방향 오류", s)
