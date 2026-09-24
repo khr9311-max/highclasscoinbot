@@ -126,15 +126,25 @@ print('Portfolio funded and ready; starting live services')
 PYCODE
 
 systemctl enable --now btc-portfolio btc-portfolio-notify
-sleep 5
-systemctl is-active --quiet btc-portfolio
-systemctl is-active --quiet btc-portfolio-notify
-"$PY" - "$NEW/status.json" <<'PYCODE'
+attempt=0
+while :; do
+    systemctl is-active --quiet btc-portfolio
+    systemctl is-active --quiet btc-portfolio-notify
+    if test -f "$NEW/status.json" && "$PY" - "$NEW/status.json" <<'PYCODE'
 import json, sys, time
 result = json.load(open(sys.argv[1]))
-if result.get('mode') != 'live' or result.get('orders_enabled') is not True or time.time()*1000-result.get('updated_at_ms', 0) > 90000:
-    raise RuntimeError('Live portfolio heartbeat missing or stale')
-print('Live portfolio heartbeat:', result.get('result', {}).get('status'), 'pending:', result.get('pending'))
+assert (result.get('mode') == 'live' and result.get('orders_enabled') is True and
+        time.time()*1000-result.get('updated_at_ms', 0) < 90000 and
+        result.get('result', {}).get('status') == 'READY' and
+        result.get('pending') == 0 and not result.get('halt'))
 PYCODE
+    then
+        break
+    fi
+    attempt=$((attempt + 1))
+    test "$attempt" -le 12
+    sleep 5
+done
+echo 'Live portfolio heartbeat: READY; pending: 0'
 phase=completed
 echo "Live portfolio cutover complete; backup=$backup"
