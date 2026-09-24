@@ -1,0 +1,24 @@
+[Unit]
+Description=BTC portfolio alt/BTC and COIN-M execution
+After=network-online.target
+Wants=network-online.target
+Conflicts=spotlive.service coinm-live.service
+
+[Service]
+Type=simple
+User=btcspot
+Group=btcspot
+WorkingDirectory=/opt/btc-spot
+ExecStart=/opt/btc-spot/.venv/bin/python -m btc_portfolio run --config /etc/btc-spot/portfolio.json --credentials-file /etc/btc-spot/binance.env --state-dir /var/lib/btc-portfolio/live --confirm I_UNDERSTAND_LIVE_PORTFOLIO
+Restart=on-failure
+RestartSec=20
+TimeoutStopSec=45
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/btc-portfolio /opt/btc-spot/btc_portfolio/state /opt/btc-spot/btc_spot/state /opt/btc-spot/binance_coinm_v1/state
+
+[Install]
+WantedBy=multi-user.target

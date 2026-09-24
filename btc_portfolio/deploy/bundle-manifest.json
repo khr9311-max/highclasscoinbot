@@ -1,0 +1,23 @@
+{
+  "btc_portfolio/__init__.py": "e7bfa93b168f51d4cae2a57e05f072cd29b4ae6c235a8d03daf8ad656da9bef0",
+  "btc_portfolio/__main__.py": "42806e3253869066f6036fc608f71c1ed7eed4325179d3108fcfd8b109e5afd8",
+  "btc_portfolio/config.example.json": "fda671973d1a7171bb7982257aa90a87c9d57b5650457e03ba8b228e45630d9e",
+  "btc_portfolio/config.py": "85cf1f85561d00e460947269cf7c272ea152562a0fd6d259b4c77c8bdbb996f8",
+  "btc_portfolio/deploy/btc-portfolio-notify.service": "7718c2a1243d9aa3aeafe3da56b961e1882d418be798f3ca3ff476c804410299",
+  "btc_portfolio/deploy/btc-portfolio.service": "c163de46a0f0b83219cb195fbe363d60f97dfa0388db325bcc01356301c92be0",
+  "btc_portfolio/deploy/build_bundle.py": "95de25ab828d4ec58bed80ec760cb747c19feaa01652bdccec18b1cc6047e7f1",
+  "btc_portfolio/deploy/install.sh": "f76eee284961843d0c2aaee3bd884b65b4bbf248955560bb880222dfd885524a",
+  "btc_portfolio/engine.py": "7644c96030f68eb04f7596b9b5a1700a9e08aa3b03743e40cd46588f881fb536",
+  "btc_portfolio/filters.py": "4dbde68aa84b449b7f274d5a35fe9f7a905038cb3c01c9c3774cc6f1a8255000",
+  "btc_portfolio/notify.py": "3ac2c697c47288e27546ae02994c95756ffb0bde5d90a32d9c951522812e7e14",
+  "btc_portfolio/README.md": "6c4e2b87f3a032155b8abde197bb00327ee9b26c4eb176aed783908607fff5c8",
+  "btc_portfolio/runtime.py": "2325fdca97d168569585a398aad16d2bc2cb8888e16ad1da6a2abfb7fc520ea8",
+  "btc_portfolio/signals.py": "9277a63838ed75492f6ee0b76279caaf7061663014530ab125af98db77600fc8",
+  "btc_portfolio/spot_gateway.py": "958c748373e5867e828b9a0041320bfe0f03ce6496b2bf6fa78a98136be2f2c1",
+  "btc_portfolio/store.py": "cb91508a3a73f6957ed7f353bcda7de40b21d4df5ccb2db3cc6fd2a07eb25571",
+  "btc_portfolio/tests/conftest.py": "0ff50a76851831d95fe266eb807d39151122c401849ec994d09d08c960f77db5",
+  "btc_portfolio/tests/test_portfolio.py": "bd82eb9c78f203bde11abc1d036b00c1e69488902273ad707efb3512678af9dc",
+  "btc_portfolio/tests/test_transfer.py": "c31d052a24a5bceb4228687aca30f46ebd149bde8af8f264610b442901f1e366",
+  "btc_portfolio/transfer.py": "d65b4d7723c2c1d3bc01e398b67c454082ce62c506a7440e5ef4d1d2be651bc7",
+  "btc_portfolio/venues.py": "91ac772c6c31c9cdaedeff7108cc305cf3367b18315b6847e144ff55a841be1a"
+}
