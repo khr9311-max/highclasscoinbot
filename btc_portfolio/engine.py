@@ -12,6 +12,24 @@ D = Decimal
 TERMINAL = {"FILLED", "EXPIRED", "CANCELED", "REJECTED", "EXPIRED_IN_MATCH"}
 
 
+def allocation_snapshot(config, spot_equity, coinm_equity):
+    """Report drift against the initial venue weights without moving funds."""
+    spot, coin = number(spot_equity), number(coinm_equity)
+    total = spot + coin
+    if total <= 0:
+        raise ValueError("Portfolio BTC equity must be positive")
+    target_spot = number(config.spot_btc) / config.total
+    spot_excess = spot - total * target_spot
+    threshold = max(total * D("0.05"), D("0.0001"))
+    return {"spot_equity_btc": str(spot), "coinm_equity_btc": str(coin),
+            "spot_weight_pct": str(spot / total * 100),
+            "coinm_weight_pct": str(coin / total * 100),
+            "target_spot_weight_pct": str(target_spot * 100),
+            "target_coinm_weight_pct": str((1-target_spot) * 100),
+            "spot_excess_btc": str(spot_excess),
+            "rebalance_review": abs(spot_excess) >= threshold}
+
+
 def fresh(market):
     age = time.time_ns()//1_000_000 - int(market["received_at_ms"])
     if not -5000 <= age <= 30000:
@@ -309,6 +327,8 @@ class Engine:
             return {"status": "BLOCKED", "reason": self.s.get("halt")}
         markets, fees = await self.v.markets(), await self.v.fees()
         equity = self.equity(account, markets)
+        coinm_equity = number(account["coin"].asset("BTC").margin_balance)
+        allocation = allocation_snapshot(self.c, equity-coinm_equity, coinm_equity)
         day = int(markets["coinm"]["server_time_ms"])//86_400_000
         day_start = self.s.get("day_start")
         if not day_start or day_start["day"] != day:
@@ -317,7 +337,8 @@ class Engine:
         can_enter = equity > number(day_start["equity"])*(1-number(self.c.daily_loss_fraction))
         alt, coin = alt_signal(markets["spot"]), coinm_signal(markets["coinm"])
         result = {"status": "READY", "equity_btc": str(equity), "new_entries_allowed": can_enter,
-                  "btc_usd_reference": markets["coinm"]["mark"], "alt_signal": alt, "coinm_signal": coin}
+                  "btc_usd_reference": markets["coinm"]["mark"], "alt_signal": alt, "coinm_signal": coin,
+                  "allocation": allocation}
         # Exit an alt on a stop at every poll, or rotate after a completed daily signal.
         entry = self.s.get("alt_entry")
         holdings = []

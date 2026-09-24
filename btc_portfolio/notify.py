@@ -57,6 +57,17 @@ async def dispatch(directory, config, delivery, fx, session):
                 f"현물 원장 {state.get('wallet')}\n차단 사유 {state.get('halt') or result.get('reason') or result.get('reasons') or '-'}")
         if result.get("equity_btc"):
             body += f"\nBTC 환산 운용자산 {result['equity_btc']} BTC"
+        allocation = result.get("allocation")
+        if allocation:
+            from decimal import Decimal
+            spot_pct = Decimal(allocation["spot_weight_pct"])
+            coin_pct = Decimal(allocation["coinm_weight_pct"])
+            body += (f"\n운용 배분 현물 {spot_pct:.1f}% / COIN-M {coin_pct:.1f}%"
+                     f" (목표 {Decimal(allocation['target_spot_weight_pct']):.0f}% /"
+                     f" {Decimal(allocation['target_coinm_weight_pct']):.0f}%)")
+            if allocation["rebalance_review"]:
+                body += (f"\n재배분 검토: 현물 목표 초과분 {allocation['spot_excess_btc']} BTC"
+                         " (자동 이체·위험한도 변경 없음)")
         delivery.mark(key, await send_message(session, config, body))
 
 

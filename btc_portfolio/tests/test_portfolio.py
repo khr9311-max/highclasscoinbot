@@ -293,6 +293,18 @@ def test_configuration_cannot_silently_increase_risk():
         Config(spot_btc="NaN")
 
 
+def test_allocation_review_reports_material_drift_without_changing_budgets():
+    from btc_portfolio.engine import allocation_snapshot
+    config = Config()
+    initial = allocation_snapshot(config, D(".0012"), D(".0018"))
+    assert initial["spot_weight_pct"] == "40.0"
+    assert initial["rebalance_review"] is False
+    grown = allocation_snapshot(config, D(".0016"), D(".0018"))
+    assert grown["rebalance_review"] is True
+    assert D(grown["spot_excess_btc"]) == D(".00024")
+    assert config.spot_btc == "0.0012" and config.coinm_btc == "0.0018"
+
+
 def test_ledger_binding_rejects_strategy_or_budget_change(tmp_path):
     path = tmp_path/"ledger.sqlite3"
     Store(path,"one","live").close()
