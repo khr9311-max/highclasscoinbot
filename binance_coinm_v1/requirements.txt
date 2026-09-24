@@ -1,0 +1,8 @@
+# Binance COIN-M V1 전용 의존성 (저장소 루트 requirements.txt 와 같은 버전으로 고정)
+# 검증 환경: Python 3.12.7 / Windows
+aiohttp==3.14.3
+websockets==15.0.1
+numpy==2.4.6
+scipy==1.18.1
+python-dotenv==1.2.2
+pytest==9.1.1
