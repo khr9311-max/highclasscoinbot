@@ -1,4 +1,45 @@
-# AI 퀀트 자동매매 마스터 시스템 (Upbit)
+# Binance 봇 운영
+
+**2026-09-25 구현 추가:** [BTC 포트폴리오 실행기](btc_portfolio/README.md)는
+COIN-M BTC 담보 롱·숏과 ETH/BTC·BNB/BTC·SOL/BTC·XRP/BTC 현물 주문을 지원한다.
+현재 AWS 운영 중인 BTCUSDT 봇과 별도이며 아직 배포 전환하지 않았다.
+전환에는 기존 서비스 종료, COIN-M BTC 배정 및 격리·레버리지 설정 확인이 필요하다.
+
+BTC 수량 증가를 목표로 기존 전략의 전제를 제거한 독립 연구는
+[`btc_lab/`](btc_lab/README.md)와 [최신 성장 연구](btc_lab/GROWTH_2026-09-24.md)에 있다.
+현재 실행 경로는 **[BTCUSDT 현물 분할 모멘텀 봇](btc_spot/README.md)**이다.
+0.003 BTC를 배정하는 소액 현물 전략에 실주문 제출·체결 회계·재시작 복구를 연결했다.
+기존 현물 live 프로세스는 AWS로 이전했다. PC의 거래 프로세스는 종료 상태다.
+이전 시점 목표는 BTC 100% 보유였으며 이후 상태는 AWS 원장과 텔레그램으로 확인한다.
+paper/live 원장은 분리돼 있다.
+[실계좌와 PC 실행 상태](btc_spot/PREPARATION_2026-09-24.md),
+[AWS 구성과 이전 절차](btc_spot/deploy/README.md)를 참고한다.
+최신 [소액 거래 방식·수량 재검증](btc_lab/SMALL_CAPITAL_2026-09-24.md)에서는 현물 비중 조절과 선물 수량 개선을 비교했다.
+
+```powershell
+.\run_btc_spot.ps1 Prepare
+.\run_btc_spot.ps1 Status -Mode live
+.\run_btc_spot.ps1 Stop -Mode live
+```
+
+기존 **Binance COIN-M V1**의 설정은 `binance_coinm_v1/.env`,
+상태·로그는 `binance_coinm_v1/state/`를 사용한다.
+[Binance 실행·검증 안내](binance_coinm_v1/README.md)는 기존 전략에 해당한다.
+아래 명령은 새 모멘텀 전략의 실행 명령이 아니다.
+
+```powershell
+.\run_binance.ps1 check       # 공개 API 및 계약 확인
+.\run_binance.ps1 gate        # 실거래 게이트 상태
+.\run_binance.ps1 run         # 전용 .env의 EXECUTION_MODE로 실행 (기본 paper)
+```
+
+`python -m binance_coinm_v1 ...`도 같은 실행 경로다. 루트 `.env`, `main.py`,
+`deploy/coinbot.service`는 기존 Upbit용이다. 기존 서비스가 외부 서버에 설치돼 있다면
+자동 시작 대상도 별도로 확인해야 한다. Binance 실거래는 수익성 검증 미통과로 차단된다.
+
+---
+
+# 기존 시스템 참고 문서 (Upbit)
 
 ![License](https://img.shields.io/badge/License-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/Python-3.12-blue)

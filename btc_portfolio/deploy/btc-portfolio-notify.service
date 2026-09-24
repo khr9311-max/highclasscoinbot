@@ -1,0 +1,22 @@
+[Unit]
+Description=BTC portfolio Telegram outbox
+After=network-online.target btc-portfolio.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=btcspot
+Group=btcspot
+WorkingDirectory=/opt/btc-spot
+ExecStart=/opt/btc-spot/.venv/bin/python -m btc_portfolio.notify --credentials-file /etc/btc-spot/binance.env --state-dir /var/lib/btc-portfolio/live
+Restart=on-failure
+RestartSec=20
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/btc-portfolio
+
+[Install]
+WantedBy=multi-user.target

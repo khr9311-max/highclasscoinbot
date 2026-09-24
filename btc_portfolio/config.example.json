@@ -1,0 +1,11 @@
+{
+  "spot_btc": "0.0012",
+  "coinm_btc": "0.0018",
+  "risk_fraction": "0.005",
+  "daily_loss_fraction": "0.02",
+  "alt_stop_fraction": "0.05",
+  "alt_max_fraction": "0.25",
+  "coinm_max_exposure": "1.25",
+  "max_leverage": 3,
+  "symbols": ["ETHBTC", "BNBBTC", "SOLBTC", "XRPBTC"]
+}
