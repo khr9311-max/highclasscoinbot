@@ -90,6 +90,9 @@ class ExecutionEngine:
         self.market = MarketState(self.config.TARGET_TICKERS)
         self.ws_feed.add_callback(self.market.on_message)
 
+        # 가격행동 전략이 알트에 라이브 거래를 걸면 여기에 들어간다 (watch/unwatch)
+        self.extra_tickers: set = set()
+
         self.active_orders: Dict[str, Dict[str, Any]] = {}
         self.balances: Dict[str, Dict[str, float]] = {}
         self._balances_ts: float = 0.0
@@ -155,8 +158,34 @@ class ExecutionEngine:
         price = self._price_for(ticker)
         return vol * price if price else 0.0
 
+    # ------------------------------------------------------------------
+    # 동적 종목 (가격행동 전략의 알트 라이브 거래)
+    # ------------------------------------------------------------------
+    def tracked_tickers(self) -> List[str]:
+        extra = getattr(self, "extra_tickers", set())
+        return list(dict.fromkeys(list(self.config.TARGET_TICKERS) + sorted(extra)))
+
+    def watch(self, ticker: str):
+        """알트 라이브 거래가 걸릴 때 시세 구독 + 노출 회계에 넣는다."""
+        if ticker in self.config.TARGET_TICKERS or ticker in self.extra_tickers:
+            return
+        self.extra_tickers.add(ticker)
+        self.market.add(ticker)
+        self.ws_feed.set_tickers(self.tracked_tickers())
+        logger.info("시세 구독 추가: %s", ticker)
+
+    def unwatch(self, ticker: str):
+        """거래가 끝나면 뺀다. 보유분이 남아 있으면 노출 회계를 위해 유지한다."""
+        # 수수료 반올림으로 남는 먼지 수량 때문에 구독이 영원히 안 풀리지 않도록
+        # 최소 주문금액 미만이면 '보유 없음' 으로 본다.
+        if ticker not in self.extra_tickers or self.position_value_krw(ticker) >= self.config.MIN_ORDER_KRW:
+            return
+        self.extra_tickers.discard(ticker)
+        self.ws_feed.set_tickers(self.tracked_tickers())
+        logger.info("시세 구독 해제: %s", ticker)
+
     def total_exposure_krw(self) -> float:
-        return sum(self.position_value_krw(t) for t in self.config.TARGET_TICKERS)
+        return sum(self.position_value_krw(t) for t in self.tracked_tickers())
 
     def total_equity_krw(self) -> float:
         return self.available_krw() + self.total_exposure_krw()
@@ -258,7 +287,9 @@ class ExecutionEngine:
         await self.notifier.notify_trade("BID", ticker, price, amount_krw)
         return True
 
-    async def place_market_sell(self, ticker: str, volume: Optional[float] = None) -> bool:
+    async def place_market_sell(self, ticker: str, volume: Optional[float] = None,
+                                urgent: bool = False) -> bool:
+        """urgent=True: 손절/목표 청산. 재주문 쿨다운을 건너뛴다 (risk.check_sell 참고)."""
         ok, why = self.market_ready(ticker)
         if not ok:
             logger.warning("매도 취소: %s", why)
@@ -266,10 +297,15 @@ class ExecutionEngine:
 
         await self._refresh_balances()
         held = self.held_volume(ticker)
+        if urgent and held <= 0 and not self.config.DRY_RUN:
+            # 매수 직후 손절이면 잔고 캐시(15초)에 아직 체결분이 없다. 손절을
+            # '미보유' 로 거부하지 않도록 이때만 바로 다시 조회한다.
+            await self._refresh_balances(force=True)
+            held = self.held_volume(ticker)
         volume = held if volume is None else min(volume, held)   # 보유량 초과 매도 방지
         price = self._price_for(ticker) or 0.0
 
-        decision = self.risk.check_sell(ticker, volume, held, price)
+        decision = self.risk.check_sell(ticker, volume, held, price, urgent=urgent)
         if not decision:
             logger.warning("매도 거부 [%s]: %s", ticker, decision.reason)
             return False
@@ -396,8 +432,9 @@ class ExecutionEngine:
             logger.info("[DRY-RUN] 모의 장부 초기화: KRW %s", f"{self.sim_krw:,.0f}")
 
         recovered = 0
+        tracked = set(self.tracked_tickers())      # 가격행동 알트 라이브 거래 포함
         for order in await self.client.get_open_orders():
-            if order.market not in self.config.TARGET_TICKERS:
+            if order.market not in tracked:
                 continue
             self.active_orders[order.uuid] = {
                 "ticker": order.market,

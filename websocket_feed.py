@@ -18,6 +18,7 @@ class WebsocketFeed:
         self.callbacks: List[Callable[[Dict[str, Any]], None]] = []
         self._is_running = False
         self._ws = None
+        self._close_tasks: set = set()
 
         # 관측 지표 (하트비트/모니터링용)
         self.last_message_ts: float = 0.0
@@ -26,6 +27,27 @@ class WebsocketFeed:
 
     def add_callback(self, callback: Callable[[Dict[str, Any]], None]):
         self.callbacks.append(callback)
+
+    def set_tickers(self, tickers: List[str]) -> bool:
+        """
+        구독 종목 교체. 바뀌었으면 현재 연결을 닫아 재연결 루프가 새 목록으로
+        다시 구독하게 한다 (정상 종료라 백오프 없이 바로 붙는다).
+        가격행동 전략이 알트에 라이브 거래를 걸 때만 호출된다.
+        """
+        new = list(dict.fromkeys(tickers))
+        if new == self.tickers:
+            return False
+        self.tickers = new
+        ws = self._ws
+        if ws is not None:
+            try:
+                # 참조를 붙잡아 두지 않으면 태스크가 GC 로 사라질 수 있다
+                task = asyncio.get_running_loop().create_task(ws.close())
+                self._close_tasks.add(task)
+                task.add_done_callback(self._close_tasks.discard)
+            except RuntimeError:
+                pass
+        return True
 
     def age(self) -> float:
         """마지막 메시지 이후 경과 시간(초)."""

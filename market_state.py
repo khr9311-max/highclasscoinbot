@@ -210,6 +210,11 @@ class MarketState:
             st.update_trade(data)
         self.message_count += 1
 
+    def add(self, ticker: str) -> TickerState:
+        if ticker not in self.states:
+            self.states[ticker] = TickerState(ticker)
+        return self.states[ticker]
+
     def get(self, ticker: str) -> Optional[TickerState]:
         return self.states.get(ticker)
 

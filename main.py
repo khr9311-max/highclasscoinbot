@@ -18,6 +18,10 @@ from free_energy_ppo import OnlineFreeEnergyAgent, MarketReplayBuffer, OBS_DIM
 from data_recorder import DataRecorder
 from meta_trainer import MetaTrainer
 from news_feed import NewsFeed
+from candle_feed import CandleFeed, AltUniverse
+from naked_strategy import NakedStrategy, feature_row
+from meta_trainer import NakedMetaTrainer
+from validate_naked import auto_validate, check_gate
 
 logging.basicConfig(
     level=logging.INFO,
@@ -90,6 +94,36 @@ class MainPipeline:
 
         self.scheduler = Scheduler()
         self.primary_ticker = Config.TARGET_TICKERS[0]
+
+        # ---- 가격행동(Naked Forex) 전략 ----
+        # 봉 마감마다 캔들로 판정하고, 모든 신호를 종이 매매로 굴린다.
+        # 웹소켓이 붙은 코어 종목만 실제 주문을 낸다(알트는 섀도).
+        self._news_scores = {}        # ticker -> (score, time.time()) 뉴스 거부권용
+        self.candle_feed = CandleFeed()
+        self.alt_universe = AltUniverse(
+            self.candle_feed.client, exclude=Config.TARGET_TICKERS,
+            top_n=Config.NAKED_ALT_TOP_N, min_trade_krw=Config.NAKED_ALT_MIN_TRADE_KRW,
+            max_spread=Config.NAKED_ALT_MAX_SPREAD, limiter=self.candle_feed.limiter,
+        )
+        self.naked = NakedStrategy(
+            Config.STATE_DIR, self.candle_feed, Config, universe=self.alt_universe,
+            buy=self._naked_buy, sell=self._naked_sell, price_of=self._naked_price,
+            entry_gate=self._naked_gate, notify=self.engine.notifier.send_message,
+            watch=self.engine.watch, unwatch=self.engine.unwatch,
+        )
+        self.naked.restore_watches()
+        # 설정상 실주문을 켰는지. 검증 게이트는 이걸 넘어서 열지 않는다.
+        self._naked_live_configured = self.naked.live_enabled
+        self._naked_gate_ok: Optional[bool] = None
+        self._naked_validate_task: Optional[asyncio.Task] = None
+        self.naked_meta_path = os.path.join(Config.STATE_DIR, "naked_meta_model.pkl")
+        self.naked_meta_trainer = NakedMetaTrainer(
+            Config.STATE_DIR, self.naked_meta_path, variant=Config.NAKED_EXIT_MODE,
+        )
+        self._naked_meta_bundle = None
+        self._naked_meta_mtime = 0.0
+        self._naked_scan_task: Optional[asyncio.Task] = None
+        self._naked_universe_task: Optional[asyncio.Task] = None
 
         # 시장 특징 벡터 이력. 피셔 정보행렬을 여기서 계산한다.
         # (기존에는 np.random.randn(5) 를 '그래디언트'라며 쌓고 있었다)
@@ -326,6 +360,8 @@ class MainPipeline:
                 if not c_res.get("ok"):
                     logger.warning("[%s] Crypto Agent 응답 실패 - 이번 주기 건너뜀.", ticker)
                     continue
+                if n_res.get("ok"):
+                    self._news_scores[ticker] = (float(n_res.get("score", 0.0)), time.time())
                 if not n_res.get("ok"):
                     # 예전 규칙은 news=0 을 '합의 실패'로 보고 무조건 막았지만,
                     # 지금은 crypto 단독 기준이 올라갈 뿐 막히지는 않는다.
@@ -369,6 +405,13 @@ class MainPipeline:
 
         if action == "HOLD":
             log_signal(False, "HOLD")
+            return
+
+        if Config.STRATEGY_MODE != "llm":
+            # 가격행동 모드: LLM 판정은 연구용 기록만 남긴다. 두 경로가 같은
+            # 종목에 주문을 내면 포지션이 엉킨다(가격행동 쪽 손절이 LLM 매수분
+            # 까지 팔아버리는 식). 뉴스 점수는 가격행동 진입의 거부권으로 쓴다.
+            log_signal(False, f"전략모드 {Config.STRATEGY_MODE} - LLM 판정은 기록만")
             return
 
         if not is_live:
@@ -415,6 +458,149 @@ class MainPipeline:
             ok = await self.engine.place_market_sell(ticker)
         log_signal(bool(ok))
 
+    # ------------------------------------------------------------------
+    # 가격행동 전략 연결부
+    # ------------------------------------------------------------------
+    async def _naked_buy(self, ticker: str, krw: float) -> bool:
+        return await self.engine.place_market_buy(ticker, krw)
+
+    async def _naked_sell(self, ticker: str, volume: float) -> bool:
+        # 손절/목표 청산은 재주문 쿨다운을 건너뛴다 (risk_manager.check_sell)
+        return await self.engine.place_market_sell(ticker, volume, urgent=True)
+
+    def _naked_price(self, ticker: str) -> Optional[float]:
+        ok, _ = self.engine.market_ready(ticker)
+        if not ok:
+            return None
+        st = self.engine.market.get(ticker)
+        return st.last_price if st else None
+
+    def _naked_gate(self, ticker: str, sig: dict):
+        """가격행동 라이브 진입 필터. 신호가 나올 때(봉 마감) 한 번 판단한다."""
+        if time.monotonic() < self._cb_active_until:
+            return False, "서킷브레이커 쿨다운"
+        if self.engine.risk.halted:
+            return False, f"리스크 정지 ({self.engine.risk.halt_reason})"
+        ns = self._news_scores.get(ticker)
+        news = None
+        if ns and time.time() - ns[1] < 1800:
+            news = ns[0]
+            if news <= Config.NAKED_NEWS_VETO:
+                return False, f"뉴스 거부권 (news={news:+.2f})"
+        p = self._naked_meta_probability(ticker, sig)
+        if p is not None and p < Config.NAKED_META_MIN_PROB:
+            return False, f"메타 필터 차단 (p={p:.3f})"
+        news_s = f"{news:+.2f}" if news is not None else "없음"
+        meta_s = f"{p:.3f}" if p is not None else "미사용"
+        return True, f"필터 통과 (news={news_s}, meta={meta_s})"
+
+    def _naked_meta_probability(self, ticker: str, sig: dict) -> Optional[float]:
+        """CV AUC 가 기준 이상인 가격행동 메타 모델이 있을 때만 확률을 준다."""
+        try:
+            mtime = os.path.getmtime(self.naked_meta_path)
+        except OSError:
+            return None
+        if self._naked_meta_bundle is None or mtime > self._naked_meta_mtime:
+            self._naked_meta_bundle = NakedMetaTrainer.load_model(self.naked_meta_path)
+            self._naked_meta_mtime = mtime
+        b = self._naked_meta_bundle
+        if not b:
+            return None
+        auc = b["meta"].get("cv_auc")
+        if auc is None or auc < Config.NAKED_META_MIN_AUC:
+            return None
+        try:
+            import pandas as pd
+            row = feature_row(sig, ticker not in Config.TARGET_TICKERS)
+            X = pd.DataFrame([row], columns=b["meta"]["feature_names"])
+            return float(b["model"].predict_proba(X)[:, 1][0])
+        except Exception as e:
+            logger.warning("가격행동 메타 예측 실패: %s", e)
+            return None
+
+    def _apply_naked_gate(self) -> None:
+        """
+        실주문 모드에서는 검증 리포트가 통과여야 가격행동 주문을 낸다.
+        리포트는 매일 새로 쓰이므로 게이트도 닫혔다 다시 열릴 수 있다.
+        설정(NAKED_LIVE 등)에서 끈 것은 여기서 켜지 않는다.
+        """
+        if not self._naked_live_configured:
+            return
+        if Config.DRY_RUN or not Config.NAKED_REQUIRE_VALIDATION:
+            self.naked.live_enabled = True
+            return
+        ok, why = check_gate(Config.STATE_DIR, Config.NAKED_VALIDATION_MAX_AGE_DAYS,
+                             Config.NAKED_EXIT_MODE, Config.NAKED_LIVE_PATTERNS)
+        prev, self._naked_gate_ok = self._naked_gate_ok, ok
+        self.naked.live_enabled = ok
+        if ok:
+            logger.warning("가격행동 실주문 게이트 열림: %s", why)
+            if prev is False:
+                self._spawn(self.engine.notifier.send_message(
+                    f"<b>✅ 가격행동 실주문 활성</b>\n{why}"
+                ), "naked_gate_notify")
+            return
+        logger.critical("가격행동 실주문 비활성 - %s (종이 매매는 계속)", why)
+        if prev is not False:
+            # 닫혀도 이미 들어간 포지션의 청산은 계속한다 (대기 중 매수스톱만 취소)
+            self._spawn(self.engine.notifier.send_message(
+                f"<b>⛔ 가격행동 실주문 비활성</b>\n{why}\n"
+                f"보유 중인 거래의 청산과 종이 매매·기록은 계속합니다."
+            ), "naked_gate_notify")
+
+    async def _naked_validate(self):
+        """
+        백테스트 + 표본 외 종이 매매로 매일 재평가. 백테스트가 오래됐으면
+        새로 돌린다(수 분, 캔들 요청은 초당 3회로 라이브 스캔과 한도를 나눔).
+        """
+        try:
+            res = await auto_validate(Config.STATE_DIR, Config,
+                                      Config.NAKED_BACKTEST_REFRESH_DAYS,
+                                      Config.NAKED_BACKTEST_DAYS)
+            rep = res.get("report")
+            if rep:
+                paper = rep.get("paper") or {}
+                logger.info(
+                    "가격행동 검증%s: %s | 거래 %s · 평균 %s · DSR %s · PBO %s · 표본외 종이 %s건",
+                    " (백테스트 갱신)" if res.get("backtest_refreshed") else "",
+                    "통과" if rep["passed"] else "미통과",
+                    rep["chosen"].get("n"), rep["chosen"].get("mean_net"),
+                    rep["dsr"], rep["pbo"], paper.get("n", 0),
+                )
+            else:
+                logger.warning("가격행동 검증: 백테스트 거래가 없어 리포트를 만들지 못함")
+        except Exception as e:
+            logger.exception("가격행동 자동 검증 실패: %s", e)
+        self._apply_naked_gate()
+
+    async def _naked_refresh_universe(self):
+        if Config.NAKED_ALTS_ENABLED:
+            await self.alt_universe.refresh()
+
+    async def _naked_scan(self):
+        n = await self.naked.scan()
+        if n:
+            logger.info("가격행동 스캔: 봉 %d개 처리 | %s", n, self.naked.summary())
+
+    async def naked_tick(self):
+        """클럭 iterator. 스캔 스케줄 + 라이브 진입·청산(매 틱)."""
+        if self.scheduler.due("naked_universe", Config.NAKED_UNIVERSE_REFRESH_SEC):
+            if not self._naked_universe_task or self._naked_universe_task.done():
+                self._naked_universe_task = self._spawn(self._naked_refresh_universe(),
+                                                        "naked_universe")
+        # 스캔은 20초마다 '새 봉이 마감됐나' 만 확인한다. 실제 캔들 요청은
+        # 종목별로 봉이 마감됐을 때만 나간다 (CandleFeed 캐시).
+        if self.scheduler.due("naked_scan", 20.0):
+            if not self._naked_scan_task or self._naked_scan_task.done():
+                self._naked_scan_task = self._spawn(self._naked_scan(), "naked_scan")
+        # 청산은 서킷브레이커 중에도 나가야 한다. 신규 진입만 막는다.
+        await self.naked.on_tick(can_enter=time.monotonic() >= self._cb_active_until)
+        if self.scheduler.due("naked_heartbeat", 600.0):
+            logger.info("가격행동 | %s", self.naked.summary())
+        if Config.NAKED_AUTO_VALIDATE and self.scheduler.due("naked_validate", 86400.0):
+            if not self._naked_validate_task or self._naked_validate_task.done():
+                self._naked_validate_task = self._spawn(self._naked_validate(), "naked_validate")
+
     async def _maintain_and_train(self):
         """
         자정 경과 시 전날 CSV 를 Parquet 으로 압축하고 오래된 파일을 정리한다.
@@ -444,6 +630,15 @@ class MainPipeline:
                 )
             else:
                 logger.info("메타 모델 학습 보류: %s", result.get("reason"))
+
+            nres = await asyncio.to_thread(self.naked_meta_trainer.train_if_ready)
+            if nres.get("trained"):
+                logger.info("가격행동 메타 모델 갱신: 표본 %d · CV AUC %s",
+                            nres["n_samples"], nres.get("cv_auc"))
+            else:
+                logger.info("가격행동 메타 학습 보류: %s", nres.get("reason"))
+            # 자동 검증이 며칠째 실패해 리포트가 기한을 넘기면 실주문을 끈다
+            self._apply_naked_gate()
         except Exception as e:
             logger.exception("데이터 유지보수/학습 실패: %s", e)
 
@@ -499,14 +694,32 @@ class MainPipeline:
         logger.info("AI 퀀트 트레이딩 봇 시작 (%s)", mode)
 
         await self.engine.reconcile_on_startup()
+        if Config.DRY_RUN:
+            # 모의 장부는 재시작 때 실잔고로 초기화된다. 가격행동이 모의로 보유 중이던
+            # 거래를 다시 얹어야 청산(모의 매도)이 '보유량 0' 으로 거부되지 않는다.
+            for tr in self.naked.live.values():
+                if tr.status == "open" and tr.volume > 0:
+                    cur = tr.ticker.split("-", 1)[1]
+                    self.engine.sim_positions[cur] = (
+                        self.engine.sim_positions.get(cur, 0.0) + tr.volume)
         self.rl_agent.load_model()
 
+        self._apply_naked_gate()
+        naked_state = ("가격행동 주문 ON" if self.naked.live_enabled
+                       else "가격행동 종이매매만")
         await self.engine.notifier.notify_startup(
             mode,
+            f"전략 {Config.STRATEGY_MODE} ({naked_state}) | "
             f"종목 {', '.join(Config.TARGET_TICKERS)} | {self.engine.risk.summary()}",
         )
 
         self.engine.clock.add_iterator(self.process_tick)
+        self.engine.clock.add_iterator(self.naked_tick)
+        # 기동 직후 알트 목록과 첫 스캔 (스케줄러는 한 주기 뒤부터 발동한다)
+        self._naked_universe_task = self._spawn(self._naked_refresh_universe(), "naked_universe")
+        self._naked_scan_task = self._spawn(self._naked_scan(), "naked_scan")
+        if Config.NAKED_AUTO_VALIDATE:
+            self._naked_validate_task = self._spawn(self._naked_validate(), "naked_validate")
         self._install_signal_handlers()
 
         runner = asyncio.create_task(self.engine.run(), name="engine")
@@ -516,6 +729,8 @@ class MainPipeline:
 
         if stopper in done:
             logger.info("종료 신호 수신 - 정리 중...")
+            # 엔진이 거래소 클라이언트를 닫기 전에 진행 중인 가격행동 주문을 끝낸다
+            await self.naked.drain(20.0)
             self.engine.stop()
             try:
                 await asyncio.wait_for(runner, timeout=15.0)
@@ -552,6 +767,12 @@ class MainPipeline:
         except Exception as e:
             logger.error("서킷브레이커 기준선 저장 실패: %s", e)
         self.rl_agent.save_model()
+        try:
+            await self.naked.drain(20.0)
+            self.naked.save()
+            await self.candle_feed.close()
+        except Exception as e:
+            logger.error("가격행동 상태 저장/정리 실패: %s", e)
         try:
             await self.news_feed.close()
         except Exception as e:

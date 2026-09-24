@@ -358,6 +358,132 @@ class MetaTrainer:
             return None
 
 
+class NakedMetaTrainer:
+    """
+    가격행동 전략 전용 메타 모델.
+
+    1차 신호는 패턴(price_action)이고, 라벨은 그 신호의 종이 매매 결과다
+    (비용 차감 순수익 > 0 이면 1). LLM 메타 모델과 달리 삼중장벽을 따로
+    만들지 않는다 - 패턴이 손절(꼬리 아래)과 목표(다음 존)를 이미 정해 주므로
+    그게 곧 구조적 장벽이다.
+
+    표본은 청산 방식 하나(운용 중인 NAKED_EXIT_MODE)로만 쓴다. 같은 신호를 청산 방식 4가지로
+    굴린 종이 거래를 전부 넣으면 한 신호가 4번 들어가 CV 가 부풀려진다.
+    백테스트 거래(naked/backtest_trades.jsonl)도 표본으로 쓴다.
+    """
+
+    def __init__(self, data_dir: str, model_path: str, variant: str = "zone",
+                 min_samples: int = 200):
+        self.data_dir = data_dir
+        self.model_path = model_path
+        self.variant = variant
+        self.min_samples = min_samples
+
+    def load_trades(self) -> List[Dict[str, Any]]:
+        base = os.path.join(self.data_dir, "naked")
+        paths = sorted(glob.glob(os.path.join(base, "trades", "*.jsonl")))
+        bt = os.path.join(base, "backtest_trades.jsonl")
+        if os.path.exists(bt):
+            paths.append(bt)
+        out = []
+        for p in paths:
+            try:
+                with open(p, encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            r = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if (r.get("filled") and r.get("status") == "closed"
+                                and r.get("variant") == self.variant
+                                and r.get("source", "paper") in ("paper", "backtest")):
+                            out.append(r)
+            except Exception as e:
+                logger.warning("가격행동 거래 로딩 실패 (%s): %s", os.path.basename(p), e)
+        return out
+
+    def build_dataset(self):
+        from naked_strategy import feature_row, feature_names
+        trades = self.load_trades()
+        if not trades:
+            return None
+        # 같은 신호가 백테스트와 종이 매매에 둘 다 있으면 하나만
+        seen, rows, labels, t0s, t1s = set(), [], [], [], []
+        for r in trades:
+            key = (r["ticker"], r["signal_ts"], r["pattern"])
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(feature_row(r["signal"], bool(r.get("is_alt"))))
+            labels.append(1 if float(r.get("net_ret", 0.0)) > 0 else 0)
+            t0s.append(float(r["signal_ts"]))
+            t1s.append(float(r.get("exit_ts") or r["signal_ts"]))
+        order = np.argsort(t0s)
+        idx = pd.DatetimeIndex(pd.to_datetime(np.asarray(t0s)[order], unit="s"))
+        if idx.has_duplicates:
+            bump = pd.to_timedelta(
+                pd.Series(np.arange(len(idx))).groupby(idx.astype("int64")).cumcount().to_numpy(),
+                unit="ms",
+            )
+            idx = idx + bump
+        X = pd.DataFrame(np.asarray(rows)[order], columns=feature_names(), index=idx)
+        y = pd.Series(np.asarray(labels)[order], name="meta_label", index=idx)
+        t1 = pd.Series(pd.to_datetime(np.asarray(t1s)[order], unit="s"), name="t1", index=idx)
+        # 종료 시각이 시작보다 앞일 수 없다 (같은 봉 청산은 같은 시각)
+        t1 = t1.where(t1.values >= idx.values, pd.Series(idx, index=idx))
+        return X, y, t1
+
+    def train_if_ready(self) -> Dict[str, Any]:
+        ds = self.build_dataset()
+        if ds is None:
+            return {"trained": False, "reason": "가격행동 거래 표본 없음"}
+        X, y, t1 = ds
+        n, pos = len(X), int(y.sum())
+        if n < self.min_samples:
+            return {"trained": False, "reason": f"표본 부족 ({n}/{self.min_samples})", "n": n}
+        if pos == 0 or pos == n:
+            return {"trained": False, "reason": f"한쪽 클래스만 존재 (양성 {pos}/{n})", "n": n}
+
+        import lightgbm as lgb
+        from sklearn.metrics import roc_auc_score
+        from cross_validation import PurgedKFold
+
+        aucs = []
+        try:
+            cv = PurgedKFold(n_splits=4, t1=t1, pct_embargo=0.02)
+            for tr, te in cv.split(X):
+                if len(tr) < 40 or len(te) < 15:
+                    continue
+                if y.iloc[tr].nunique() < 2 or y.iloc[te].nunique() < 2:
+                    continue
+                m = lgb.LGBMClassifier(n_estimators=120, num_leaves=7,
+                                       min_child_samples=15, verbose=-1)
+                m.fit(X.iloc[tr], y.iloc[tr])
+                aucs.append(roc_auc_score(y.iloc[te], m.predict_proba(X.iloc[te])[:, 1]))
+        except Exception as e:
+            logger.warning("가격행동 메타 CV 실패 (학습은 계속): %s", e)
+        cv_auc = float(np.mean(aucs)) if aucs else None
+
+        model = lgb.LGBMClassifier(n_estimators=120, num_leaves=7,
+                                   min_child_samples=15, verbose=-1)
+        model.fit(X, y)
+        meta = {
+            "trained_at": datetime.now().isoformat(timespec="seconds"),
+            "n_samples": n, "n_positive": pos, "positive_rate": round(pos / n, 4),
+            "cv_auc": round(cv_auc, 4) if cv_auc is not None else None,
+            "cv_folds": len(aucs), "feature_names": list(X.columns),
+            "variant": self.variant,
+        }
+        os.makedirs(os.path.dirname(self.model_path) or ".", exist_ok=True)
+        tmp = self.model_path + ".tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump({"model": model, "meta": meta}, f)
+        os.replace(tmp, self.model_path)
+        logger.info("가격행동 메타 모델: 표본 %d · 양성률 %.1f%% · CV AUC %s",
+                    n, meta["positive_rate"] * 100, meta["cv_auc"])
+        return {"trained": True, **meta}
+
+
 if __name__ == "__main__":
     import sys
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")

@@ -187,7 +187,13 @@ class RiskManager:
 
         return self._check_common(ticker)
 
-    def check_sell(self, ticker: str, volume: float, held_volume: float, price: float) -> RiskDecision:
+    def check_sell(self, ticker: str, volume: float, held_volume: float, price: float,
+                   urgent: bool = False) -> RiskDecision:
+        """
+        urgent=True 는 손절·목표가 청산이다. 재주문 쿨다운을 건너뛴다 -
+        매수스톱으로 들어가자마자 급락하면 쿨다운(60초) 동안 손절을 못 한다.
+        보유수량/최소금액 검증은 그대로 한다.
+        """
         self.roll_day_if_needed()
 
         if self.halted:
@@ -211,6 +217,8 @@ class RiskManager:
                 False, f"최소 주문금액 미달 ({notional:,.0f} < {Config.MIN_ORDER_KRW:,.0f})"
             )
 
+        if urgent:
+            return ALLOW
         return self._check_common(ticker)
 
     def _check_common(self, ticker: str) -> RiskDecision:

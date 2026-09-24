@@ -8,6 +8,7 @@
 """
 
 import asyncio
+import glob
 import json
 import os
 import shutil
@@ -649,6 +650,10 @@ def test_shadow_mode():
         pl.engine.place_market_buy = fake_buy
         pl.engine.place_market_sell = fake_sell
         pl._meta_probability = lambda *a, **k: None
+        # 이 점검은 LLM 경로의 주문을 본다. 기본 전략은 가격행동이라
+        # 그 모드에서는 LLM 판정이 주문을 내지 않는다(아래 별도 확인).
+        saved_mode = Config.STRATEGY_MODE
+        Config.STRATEGY_MODE = "llm"
 
         for t in Config.TARGET_TICKERS:
             feed_market(pl.engine.market, code=t)
@@ -681,7 +686,23 @@ def test_shadow_mode():
               by_ticker[shadow_t]["executed"] is False)
         check("섀도 사유가 구분되게 남음",
               "섀도" in by_ticker[shadow_t]["reason"], by_ticker[shadow_t]["reason"])
+
+        # 가격행동 모드: LLM 판정은 기록만, 주문 없음 (두 경로 포지션 충돌 방지)
+        Config.STRATEGY_MODE = "naked"
+        orders.clear()
+
+        async def run_naked():
+            st = pl.engine.market.get(live_t)
+            await pl._decide_one(live_t, st, st.mid_price or 1.0, 0.9, 0.5, True)
+
+        asyncio.run(run_naked())
+        with open(path, encoding="utf-8") as f:
+            last = [json.loads(line) for line in f][-1]
+        check("가격행동 모드에서 LLM 판정은 주문 안 냄", orders == [], str(orders))
+        check("가격행동 모드에서도 LLM 판정은 기록됨",
+              last["action"] == "BUY" and "기록만" in last["reason"], last["reason"])
     finally:
+        Config.STRATEGY_MODE = saved_mode
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -970,6 +991,658 @@ def test_replay_and_rl():
 
 
 # ---------------------------------------------------------------------------
+# 가격행동 (Naked Forex) 전략
+# ---------------------------------------------------------------------------
+def _bars(ohlc, period=3600, t0=1_700_000_000.0):
+    from price_action import Bars
+    rows = [(t0 + k * period, o, h, l, c, 1.0) for k, (o, h, l, c) in enumerate(ohlc)]
+    return Bars.from_rows(rows, period)
+
+
+def _downtrend_then(tail, n=30, start=116.0, step=0.5):
+    """완만한 하락(저가가 존 위) 뒤에 tail 봉들을 붙인다."""
+    ohlc, c = [], start
+    for _ in range(n):
+        o, c = c, c - step
+        ohlc.append((o, max(o, c) + 0.3, min(o, c) - 0.3, c))
+    return ohlc + list(tail)
+
+
+def _zone(price=100.0, half=0.5, touches=3):
+    from price_action import Zone
+    return Zone(price, price - half, price + half, touches)
+
+
+def _uptrend_pause_kangaroo():
+    ohlc = []
+    for j in range(60):
+        c = 100 + 0.5 * j
+        o = c - 0.4
+        ohlc.append((o, c + 0.2, o - 0.2, c))
+    for _ in range(5):                                   # 쉬어가기
+        ohlc.append((129.6, 130.0, 129.4, 129.8))
+    ohlc.append((129.7, 130.0, 127.5, 129.9))            # 추세 캥거루
+    return ohlc
+
+
+def test_price_action_patterns():
+    print("\n[11] 가격행동 패턴 (책 규칙의 숫자화)")
+    import numpy as np
+    from price_action import (kangaroo_tail, big_shadow, wammie, last_kiss,
+                              trendy_kangaroo, find_zones, evaluate_bar, Zone)
+
+    z = [_zone(100.0)]
+    prev = (102.5, 103.0, 101.8, 102.2)
+    good = _bars(_downtrend_then([prev, (102.4, 103.0, 99.8, 102.8)]))
+    i = len(good) - 1
+    check("캥거루 꼬리: 존 위 + 위쪽1/3 + 왼쪽여백", kangaroo_tail(good, i, z) is not None)
+    mid = _bars(_downtrend_then([prev, (102.4, 103.0, 99.8, 101.0)]))
+    check("캥거루 꼬리: 종가가 중간이면 아님", kangaroo_tail(mid, i, z) is None)
+    off = _bars(_downtrend_then([prev, (102.4, 103.0, 101.2, 102.8)]))
+    check("캥거루 꼬리: 존에 안 닿으면 아님", kangaroo_tail(off, i, z) is None)
+    runaway = _bars(_downtrend_then([prev, (103.4, 104.0, 99.8, 103.8)]))
+    check("캥거루 꼬리: 시가·종가가 직전 봉 밖(폭주)이면 아님", kangaroo_tail(runaway, i, z) is None)
+    # 직전 봉들의 저가가 이미 꼬리 저가 아래 = 시장이 최근에 다녀간 가격
+    no_room = _bars([(101.0, 101.2, 99.6, 101.0)] * 10 + [prev, (102.4, 103.0, 99.8, 102.8)])
+    check("캥거루 꼬리: 왼쪽 여백 없으면 아님",
+          kangaroo_tail(no_room, len(no_room) - 1, z) is None)
+
+    bs_prev = (102.2, 102.6, 101.6, 101.9)
+    bs = _bars(_downtrend_then([bs_prev, (101.8, 103.0, 99.9, 102.9)]))
+    check("빅 섀도: 감싸기 + 고가 근처 종가 + 존", big_shadow(bs, len(bs) - 1, z) is not None)
+    bs_mid = _bars(_downtrend_then([bs_prev, (101.8, 103.0, 99.9, 101.5)]))
+    check("빅 섀도: 종가가 중간이면 아님", big_shadow(bs_mid, len(bs_mid) - 1, z) is None)
+    bs_inside = _bars(_downtrend_then([bs_prev, (101.8, 102.5, 99.9, 102.4)]))
+    check("빅 섀도: 고가를 못 넘으면(감싸기 아님) 아님",
+          big_shadow(bs_inside, len(bs_inside) - 1, z) is None)
+
+    # 와미: 첫 터치 99.7 -> 반등 -> 두 번째 터치 100.1(더 높음) -> 강한 양봉
+    w = [(105.0, 105.6, 104.4, 105.0)] * 30
+    w += [(101.5, 101.6, 99.7, 100.4)]                                  # 30 첫 터치
+    w += [(100.4 + k * 0.4, 100.9 + k * 0.4, 100.7 + k * 0.4, 100.8 + k * 0.4) for k in range(6)]
+    w += [(103.0, 104.2, 102.8, 103.8), (103.8, 104.0, 102.6, 102.8), (102.8, 102.9, 101.6, 101.8),
+          (101.8, 101.9, 100.9, 101.0), (101.0, 101.1, 100.7, 100.8)]
+    w += [(100.8, 100.9, 100.1, 100.6)]                                 # 42 두 번째 터치
+    w += [(100.6, 101.8, 100.4, 101.7)]                                 # 43 신호
+    wb = _bars(w)
+    res = wammie(wb, len(wb) - 1, z)
+    check("와미: 두 번째 저점이 더 높은 이중바닥", res is not None and res["second"] > res["first"],
+          str(res and {k: res[k] for k in ("first", "second", "gap")}))
+    w_low = list(w)
+    w_low[42] = (100.8, 100.9, 99.5, 100.6)                             # 두 번째가 더 낮음
+    check("와미: 두 번째 저점이 더 낮으면 아님", wammie(_bars(w_low), len(w) - 1, z) is None)
+
+    # 라스트 키스: 횡보 박스 -> 상단 돌파 -> 상단 되돌림 양봉
+    lk, prev_c = [], 102.0
+    for j in range(41):
+        c = 102.0 + 1.5 * np.sin(2 * np.pi * j / 10)
+        lk.append((prev_c, max(prev_c, c) + 0.5, min(prev_c, c) - 0.5, c))
+        prev_c = c
+    lk.append((prev_c, 105.3, prev_c - 0.2, 105.0))                     # 41 돌파
+    lk += [(105.0, 106.4, 105.5, 106.0), (106.0, 106.6, 105.6, 105.8), (105.8, 106.0, 105.4, 105.6)]
+    lk.append((105.4, 105.9, 104.2, 105.7))                              # 45 키스
+    lkb = _bars(lk)
+    res = last_kiss(lkb, len(lkb) - 1)
+    check("라스트 키스: 박스 돌파 후 상단 되돌림", res is not None, str(res))
+    lk_bad = list(lk)
+    lk_bad[43] = (106.0, 106.1, 103.0, 103.2)                            # 박스 안 마감 = 가짜 돌파
+    check("라스트 키스: 돌파 후 박스 안 마감이면 아님",
+          last_kiss(_bars(lk_bad), len(lk_bad) - 1) is None)
+
+    tk = _bars(_uptrend_pause_kangaroo())
+    check("추세 캥거루: 상승추세 + 쉬어가기 + 꼬리 이탈", trendy_kangaroo(tk, len(tk) - 1) is not None)
+    flat = [(100.0, 100.5, 99.5, 100.1)] * 60 + _uptrend_pause_kangaroo()[60:]
+    check("추세 캥거루: 추세가 없으면 아님", trendy_kangaroo(_bars(flat), len(flat) - 1) is None)
+
+    # 존: 100 근처에서 3번 꺾인 톱니
+    saw = []
+    for rep in range(4):
+        for c in [104, 102, 100, 102, 104, 106, 108, 106]:
+            saw.append((c, c + 0.4, c - 0.4, c))
+    zones = find_zones(_bars(saw), pivot_k=2)
+    check("존: 반복해서 꺾인 가격에 존이 생김",
+          any(abs(zz.price - 100) < 0.6 and zz.touches >= 3 for zz in zones),
+          str([(round(zz.price, 1), zz.touches) for zz in zones]))
+
+    # 미래 봉 미참조: i 까지 자른 데이터와 전체 데이터의 판정이 같아야 한다
+    sig_full = evaluate_bar(good, i, z)
+    sig_cut = evaluate_bar(good.upto(i + 1), i, z)
+    check("판정이 미래 봉을 참조하지 않음",
+          [s.to_dict() for s in sig_full] == [s.to_dict() for s in sig_cut])
+    ks = [s for s in sig_full if s.pattern == "kangaroo"]
+    check("신호: 매수스톱=고가 위, 손절=저가 아래",
+          bool(ks) and ks[0].entry > 103.0 and ks[0].stop < 99.8,
+          str(ks and (ks[0].entry, ks[0].stop)))
+
+
+def _sig(entry=101.0, stop=99.0, targets=(105.0, 108.0), pattern="kangaroo", soft=None):
+    return {"pattern": pattern, "direction": 1, "kind": "entry", "bar_time": -3600.0,
+            "close_time": 0.0, "entry": entry, "stop": stop, "targets": list(targets),
+            "soft_exit": soft, "zone": None, "features": {"range_atr": 1.2}}
+
+
+def test_trade_state_machine():
+    print("\n[12] 가격행동 거래 상태기계 (매수스톱·구조적 손절·11장 청산)")
+    from naked_strategy import Trade, ROUND_TRIP_COST
+
+    tr = Trade("KRW-BTC", _sig(), "zone", 3600)
+    tr.on_bar(0, 100.5, 101.5, 100.0, 101.2)
+    check("매수스톱 체결 (고가가 진입가 돌파)", tr.status == "open" and tr.fill_px == 101.0)
+    tr.on_bar(3600, 101.2, 105.2, 101.0, 104.0)
+    r = tr.result()
+    check("존 목표가 청산", tr.status == "closed" and tr.exit_reason == "target",
+          f"{tr.exit_reason}")
+    check("순수익 = 총수익 - 왕복비용",
+          abs(r["net_ret"] - (105 / 101 - 1 - ROUND_TRIP_COST)) < 1e-12, f"{r['net_ret']:.5f}")
+
+    tr = Trade("KRW-BTC", _sig(), "zone", 3600)
+    tr.on_bar(0, 100.0, 100.8, 98.9, 99.5)
+    check("진입 전 손절선 도달 -> 신호 취소 (13장)",
+          tr.status == "cancelled" and tr.exit_reason == "stop_before_entry")
+
+    tr = Trade("KRW-BTC", _sig(), "zone", 3600)
+    tr.on_bar(0, 100.5, 101.5, 98.5, 99.0)
+    check("같은 봉 진입+손절은 손실로 (보수적)",
+          tr.status == "closed" and tr.exit_reason == "stop" and tr.result()["net_ret"] < 0)
+
+    tr = Trade("KRW-BTC", _sig(), "zone", 3600)
+    tr.on_bar(0, 100.5, 101.5, 100.0, 101.2)
+    tr.on_bar(3600, 101.0, 101.5, 98.0, 98.2)
+    check("손절", tr.exit_reason == "stop" and tr.fills[-1][1] == 99.0)
+
+    tr = Trade("KRW-BTC", _sig(), "zone", 3600)
+    tr.on_bar(0, 100.5, 101.5, 100.0, 101.2)
+    tr.on_bar(3600, 97.0, 97.5, 96.0, 96.5)
+    check("갭 하락이면 시가에 청산", tr.fills[-1][1] == 97.0)
+
+    tr = Trade("KRW-BTC", _sig(), "zone", 3600, valid_bars=2)
+    tr.on_bar(3600, 100.0, 100.5, 99.5, 100.2)
+    tr.on_bar(7200, 100.0, 102.0, 99.5, 101.5)
+    check("매수스톱 유효기간 경과 -> 취소", tr.status == "cancelled" and tr.exit_reason == "expired")
+
+    tr = Trade("KRW-BTC", _sig(), "split", 3600)
+    tr.on_bar(0, 100.5, 101.5, 100.0, 101.2)
+    tr.on_bar(3600, 101.2, 105.5, 101.2, 104.0)
+    check("분할: 첫 존에서 절반 + 손절 본전", tr.remaining == 0.5 and tr.stop == 101.0,
+          f"rem={tr.remaining} stop={tr.stop}")
+    tr.on_bar(7200, 104.0, 104.5, 100.5, 100.8)
+    check("분할: 나머지는 본전에서 청산", tr.status == "closed" and tr.fills[-1][1] == 101.0)
+
+    check("목표 존 없으면 auto -> 3봉 추적",
+          Trade("KRW-BTC", _sig(targets=()), "auto", 3600).mode == "three_bar")
+    check("목표 존 있으면 auto -> 존 청산",
+          Trade("KRW-BTC", _sig(), "auto", 3600).mode == "zone")
+
+    # 3봉 추적: 봉이 오를수록 손절이 최근 3봉 저가 아래로 따라 올라간다
+    tb = _bars([(100, 101, 99, 100.5)] * 20 + [(101, 102, 100.5, 101.8), (101.8, 103, 101.5, 102.8),
+                                               (102.8, 104, 102.5, 103.8), (103.8, 105, 103.5, 104.8)])
+    tr = Trade("KRW-BTC", _sig(targets=()), "three_bar", 3600)
+    tr.mark_filled(101.0, float(tb.t[20]))
+    for k in range(20, 24):
+        tr.on_bar_close(tb, k, False)
+    # 최근 3봉 저가(101.5, 102.5, 103.5)의 최저 - 0.05 ATR = 진입가(101) 위로 올라와야
+    check("3봉 추적 손절 상승 (최근 3봉 최저가 아래)", 101.0 < tr.stop < 101.5, f"stop={tr.stop:.3f}")
+
+    tr = Trade("KRW-BTC", _sig(), "ladder", 3600)
+    tr.mark_filled(101.0, float(tb.t[20]))
+    lb = _bars([(100, 101, 99, 100.5)] * 20 + [(101, 105.5, 100.8, 105.0)])
+    tr.on_bar_close(lb, 20, False)
+    check("사다리: 첫 존 도달 -> 손절 본전", tr.stop == 101.0 and tr.ladder_step == 1)
+
+    tr = Trade("KRW-BTC", _sig(soft=102.0), "zone", 3600)
+    tr.mark_filled(103.0, float(tb.t[20]))
+    sb = _bars([(100, 101, 99, 100.5)] * 20 + [(103, 103.5, 101.5, 101.8)])
+    check("라스트 키스: 종가가 박스 안이면 청산 사유",
+          tr.on_bar_close(sb, 20, False) == "back_in_box")
+
+    st = Trade.from_state(Trade("KRW-BTC", _sig(), "zone", 3600).to_state())
+    check("거래 상태 직렬화 왕복", st.entry == 101.0 and st.targets == [105.0, 108.0]
+          and st.status == "pending")
+
+
+def _naked_cfg(**over):
+    import types
+    base = dict(TARGET_TICKERS=["KRW-BTC", "KRW-ETH"], NAKED_LIVE_TICKERS=["KRW-BTC", "KRW-ETH"],
+                STRATEGY_MODE="naked", NAKED_LIVE=True, NAKED_LIVE_ALTS=True,
+                NAKED_PATTERNS=("kangaroo", "big_shadow", "wammie", "last_kiss", "trendy_kangaroo"),
+                NAKED_LIVE_PATTERNS=("trendy_kangaroo",), NAKED_EXIT_MODE="zone",
+                NAKED_MIN_RR=1.0, NAKED_ENTRY_VALID_BARS=2, NAKED_MAX_HOLD_BARS=72,
+                NAKED_RISK_PER_TRADE_KRW=1000.0, MAX_POSITION_KRW=50_000.0,
+                MIN_ORDER_KRW=5_000.0, NAKED_ALTS_ENABLED=True, NAKED_TF_MIN=60,
+                NAKED_ZONE_TF_MIN=240, NAKED_ZONE_BARS=200)
+    base.update(over)
+    return types.SimpleNamespace(**base)
+
+
+def test_naked_live_execution():
+    print("\n[13] 가격행동 라이브 연결 (매수스톱 체결·긴급 청산·알트 구독·영속화)")
+    from naked_strategy import NakedStrategy, PaperBook, EXIT_MODES
+
+    tmp = tempfile.mkdtemp(prefix="coinbot-naked-")
+    try:
+        calls = []
+        watched = []
+
+        async def buy(t, krw):
+            calls.append(("buy", t, round(krw)))
+            return True
+
+        async def sell(t, vol):
+            calls.append(("sell", t, vol))
+            return True
+
+        price = {"v": None}
+        ns = NakedStrategy(tmp, feed=None, cfg=_naked_cfg(), buy=buy, sell=sell,
+                           price_of=lambda t: price["v"], watch=watched.append,
+                           unwatch=lambda t: watched.append("-" + t))
+        # 라이브 대기는 실제 시각으로 만료되므로 방금 마감된 봉처럼 만든다
+        ohlc = _uptrend_pause_kangaroo()
+        bars = _bars(ohlc, t0=time.time() - len(ohlc) * 3600)
+        i = len(bars) - 1
+        ns.process_bar("KRW-BTC", bars, i, [])
+        lt = ns.live.get("KRW-BTC")
+        check("라이브 패턴 신호 -> 라이브 대기 생성", lt is not None and lt.status == "pending")
+        check("같은 신호가 종이 매매 5가지 청산방식으로도 굴러감",
+              len(ns.book.open.get("KRW-BTC", [])) == len(EXIT_MODES))
+
+        async def ticks(prices):
+            for p in prices:
+                price["v"] = p
+                await ns.on_tick(can_enter=True)
+
+        entry, stop = lt.entry, lt.stop
+        asyncio.run(ticks([entry - 0.05]))
+        check("진입가 아래에서는 주문 없음", calls == [])
+        asyncio.run(ticks([entry + 0.01]))
+        check("매수스톱 돌파 -> 시장가 매수", calls and calls[0][0] == "buy", str(calls))
+        fill = entry + 0.01
+        exp_krw = min(1000 / ((fill - stop) / fill + 0.0012), 50_000)
+        check("고정 위험 사이징 (실제 매수가 기준, 손절 시 1,000원 손실)",
+              abs(calls[0][2] - max(exp_krw, 5000)) <= 1, f"{calls[0][2]} vs {exp_krw:.0f}")
+        asyncio.run(ticks([stop - 0.01]))
+        check("손절선 이탈 -> 매도", calls[-1][0] == "sell" and "KRW-BTC" not in ns.live,
+              str(calls[-1]))
+        trades_path = glob.glob(os.path.join(tmp, "naked", "trades", "*.jsonl"))
+        recs = [json.loads(l) for p in trades_path for l in open(p, encoding="utf-8")]
+        check("라이브 거래 결과가 기록됨",
+              any(r["source"] == "live" and r["exit_reason"] == "stop" for r in recs))
+
+        # 커널 패턴이 라이브 대상이 아니면 종이 매매만
+        ns2 = NakedStrategy(tmp + "2", feed=None, cfg=_naked_cfg(NAKED_LIVE_PATTERNS=("kangaroo",)),
+                            buy=buy, sell=sell, price_of=lambda t: None)
+        ns2.process_bar("KRW-BTC", bars, i, [])
+        check("라이브 패턴이 아니면 라이브 대기 없음", "KRW-BTC" not in ns2.live)
+
+        # 알트: 신호 시 구독, 끝나면 해제
+        calls.clear()
+        ns.process_bar("KRW-ALT", bars, i, [])
+        check("알트 라이브 신호 -> 시세 구독", watched and watched[-1] == "KRW-ALT", str(watched))
+        ns.save()
+        ns_r = NakedStrategy(tmp, feed=None, cfg=_naked_cfg(), buy=buy, sell=sell,
+                             price_of=lambda t: price["v"])
+        check("재시작 후 라이브 대기 복원", "KRW-ALT" in ns_r.live
+              and ns_r.live["KRW-ALT"].status == "pending")
+        check("재시작 후 종이 거래 복원", len(ns_r.book.all_open()) == len(ns.book.all_open()))
+        alt = ns.live["KRW-ALT"]
+        asyncio.run(ticks([alt.entry + 0.01, alt.stop - 0.01]))
+        check("알트 거래 종료 -> 구독 해제", watched[-1] == "-KRW-ALT", str(watched))
+        check("알트 청산은 먼지까지 (보유량의 101% 요청)",
+              calls[-1][0] == "sell" and calls[-1][2] > 0, str(calls[-1]))
+
+        ns3 = NakedStrategy(tmp + "3", feed=None, cfg=_naked_cfg(NAKED_LIVE_ALTS=False),
+                            buy=buy, sell=sell, price_of=lambda t: None)
+        ns3.process_bar("KRW-ALT", bars, i, [])
+        check("알트 라이브 꺼져 있으면 섀도만", "KRW-ALT" not in ns3.live)
+
+        # 서킷브레이커 중에는 진입하지 않는다
+        ns4 = NakedStrategy(tmp + "4", feed=None, cfg=_naked_cfg(), buy=buy, sell=sell,
+                            price_of=lambda t: price["v"])
+        ns4.process_bar("KRW-BTC", bars, i, [])
+        calls.clear()
+        price["v"] = ns4.live["KRW-BTC"].entry + 0.01
+        asyncio.run(ns4.on_tick(can_enter=False))
+        check("서킷브레이커 중 매수스톱 보류", calls == [] and ns4.live["KRW-BTC"].status == "pending")
+
+        # 종이 장부: 종목당 청산방식별 거래 하나 (라이브와 같은 제약)
+        pb = PaperBook(("zone",), ("trendy_kangaroo",))
+        pb.process_bar("KRW-BTC", bars, i, [])
+        pb.process_bar("KRW-BTC", bars, i, [])
+        check("종이 장부 종목당 1거래", len(pb.open["KRW-BTC"]) == 1)
+    finally:
+        for sfx in ("", "2", "3", "4"):
+            shutil.rmtree(tmp + sfx, ignore_errors=True)
+
+
+def test_naked_infra():
+    print("\n[14] 가격행동 부대설비 (캔들 마감·알트 선별·긴급청산·구독·검증 게이트)")
+    import types
+    from candle_feed import candles_to_bars, AltUniverse
+    from risk_manager import RiskManager
+
+    C = lambda t, o, h, l, c: types.SimpleNamespace(
+        candle_date_time_utc=t, opening_price=o, high_price=h, low_price=l,
+        trade_price=c, candle_acc_trade_price=1.0)
+    from datetime import datetime, timezone
+    now = datetime(2026, 9, 24, 2, 30, tzinfo=timezone.utc).timestamp()
+    raw = [C("2026-09-24T02:00:00", 3, 3, 3, 3), C("2026-09-24T01:00:00", 2, 2, 2, 2),
+           C("2026-09-24T00:00:00", 1, 1, 1, 1)]
+    b = candles_to_bars(raw, 60, now)
+    check("형성 중인 봉은 버리고 시간순 정렬", list(b.c) == [1.0, 2.0], str(list(b.c)))
+
+    P = lambda m, warn=None, **caution: types.SimpleNamespace(
+        market=m, market_warning=warn,
+        market_event=types.SimpleNamespace(warning=False, caution=types.SimpleNamespace(**caution)))
+    T = lambda m, v: types.SimpleNamespace(market=m, acc_trade_price_24h=v, signed_change_rate=0.1)
+    pairs = [P("KRW-AAA"), P("KRW-BBB", warn="CAUTION"), P("KRW-CCC", trading_volume_soaring=True),
+             P("KRW-USDT"), P("KRW-DDD"), P("KRW-BTC"), P("BTC-EEE"), P("KRW-FFF")]
+    tks = [T("KRW-AAA", 9e9), T("KRW-BBB", 9e9), T("KRW-CCC", 9e9), T("KRW-USDT", 9e9),
+           T("KRW-DDD", 1e9), T("KRW-BTC", 9e9), T("KRW-FFF", 8e9)]
+    u = AltUniverse(None, exclude=["KRW-BTC"], top_n=5, min_trade_krw=5e9, max_spread=0.002)
+    sel = u.select(pairs, tks, spreads={"KRW-FFF": 0.01})
+    check("알트 선별: 유의/주의(펌프)·스테이블·저유동·넓은 스프레드·코어 제외",
+          sel == ["KRW-AAA"], str(sel))
+
+    rm = RiskManager(state_dir=tempfile.mkdtemp())
+    rm.register_order("KRW-BTC", "bid")
+    check("일반 매도는 재주문 쿨다운에 걸림",
+          not rm.check_sell("KRW-BTC", 1.0, 1.0, 10_000.0))
+    check("손절/목표 청산(urgent)은 쿨다운 건너뜀",
+          bool(rm.check_sell("KRW-BTC", 1.0, 1.0, 10_000.0, urgent=True)))
+    check("urgent 여도 보유량 초과 매도는 차단",
+          not rm.check_sell("KRW-BTC", 2.0, 1.0, 10_000.0, urgent=True))
+
+    from execution_engine import ExecutionEngine
+    from market_state import MarketState
+    from config import Config
+    eng = ExecutionEngine.__new__(ExecutionEngine)
+    eng.config = Config
+    eng.market = MarketState(Config.TARGET_TICKERS)
+    eng.extra_tickers = set()
+    subs = []
+    eng.ws_feed = types.SimpleNamespace(set_tickers=lambda t: subs.append(list(t)))
+    eng.sim_positions, eng.balances = {}, {}
+    eng.watch("KRW-ALT")
+    check("알트 구독: 시세 상태 + 웹소켓 목록에 추가",
+          eng.market.get("KRW-ALT") is not None and "KRW-ALT" in subs[-1])
+    check("알트가 노출 회계에 포함", "KRW-ALT" in eng.tracked_tickers())
+    eng.unwatch("KRW-ALT")
+    check("보유 없으면 구독 해제", "KRW-ALT" not in eng.tracked_tickers())
+
+    from validate_naked import evaluate, write_report, check_gate
+    rng = np.random.default_rng(3)
+    trades = []
+    for k in range(400):
+        for v in ("zone", "split", "ladder", "three_bar"):
+            edge = 0.006 if v == "ladder" else 0.0
+            trades.append({"ticker": "KRW-X", "pattern": "trendy_kangaroo", "variant": v,
+                           "filled": True, "status": "closed", "signal_ts": k * 36000.0,
+                           "exit_ts": k * 36000.0 + 7200, "net_ret": rng.normal(edge, 0.01),
+                           "r_net": None, "is_alt": True, "exit_reason": "stop"})
+    rep = evaluate(trades, ("trendy_kangaroo",), "ladder", paper=[])
+    check("백테스트만으로는 통과 못 함 (표본 외 종이매매 필요)", rep["passed"] is False
+          and rep["checks"]["거래 100건 이상"] is True, str(rep["checks"]))
+    paper = [dict(t, source="paper") for t in trades if t["variant"] == "ladder"][:40]
+    rep2 = evaluate(trades, ("trendy_kangaroo",), "ladder", paper=paper)
+    check("표본 외까지 양수면 통과", rep2["passed"], str(rep2["checks"]))
+    d = tempfile.mkdtemp()
+    write_report(d, rep2, {"source": "test"})
+    check("검증 게이트 통과", check_gate(d, 30)[0])
+    write_report(d, rep, {"source": "test"})
+    ok, why = check_gate(d, 30)
+    check("검증 게이트 미통과 사유 제시", not ok and "미통과" in why, why)
+    check("검증 리포트 없으면 게이트 닫힘", not check_gate(tempfile.mkdtemp(), 30)[0])
+
+
+def test_naked_review_fixes():
+    print("\n[15] 가격행동 최종 검토 수정분 (표본 일치·경쟁 조건·게이트 재개방·자동 검증)")
+    import types
+    from naked_strategy import NakedStrategy, PaperBook, Trade
+    from validate_naked import (non_overlap, select, evaluate, save_backtest, reevaluate,
+                                auto_validate, check_gate, write_report, backtest_params,
+                                backtest_meta)
+    from candle_feed import CandleFeed
+
+    ohlc = _uptrend_pause_kangaroo()
+    fresh = _bars(ohlc, t0=time.time() - len(ohlc) * 3600)
+    i = len(fresh) - 1
+
+    # (1) 종이 장부는 패턴끼리 막지 않는다 - 라이브 패턴의 표본이 다른 패턴 때문에 빠지면 안 됨
+    pb = PaperBook(("zone",), ("kangaroo", "trendy_kangaroo"))
+    other = Trade("KRW-BTC", dict(_sig(), bar_time=float(fresh.t[i]),
+                                  close_time=fresh.close_time(i)), "zone", 3600)
+    pb.open["KRW-BTC"] = [other]
+    pb.process_bar("KRW-BTC", fresh, i, [])
+    pats = sorted(tr.pattern for tr in pb.open["KRW-BTC"])
+    check("다른 패턴 종이 거래가 열려 있어도 새 패턴 신호는 기록",
+          pats == ["kangaroo", "trendy_kangaroo"], str(pats))
+    pb.process_bar("KRW-BTC", fresh, i, [])
+    check("같은 패턴·청산방식은 종목당 하나", len(pb.open["KRW-BTC"]) == 2)
+
+    # (2) 여러 패턴을 함께 쓰는 전략은 평가 때 '종목당 1거래' 적용
+    T = lambda p, s, e, filled=True, st="closed": {
+        "ticker": "KRW-X", "pattern": p, "variant": "zone", "signal_ts": s, "exit_ts": e,
+        "filled": filled, "status": st, "net_ret": 0.01, "r_net": None,
+        "is_alt": True, "exit_reason": "target"}
+    tr_all = [T("kangaroo", 0, 10), T("trendy_kangaroo", 5, 20), T("trendy_kangaroo", 12, 30),
+              T("kangaroo", 40, 41, False, "cancelled"), T("trendy_kangaroo", 40.5, 50)]
+    kept = [(t["pattern"], t["signal_ts"]) for t in non_overlap(tr_all)]
+    check("겹치는 거래 제외 (보유 중·매수스톱 대기 중 모두 점유)",
+          kept == [("kangaroo", 0), ("trendy_kangaroo", 12), ("kangaroo", 40)], str(kept))
+    check("단일 패턴 전략은 겹침 제거 없이 전부",
+          len(select(tr_all, "zone", ("trendy_kangaroo",))) == 3)
+    check("복수 패턴 전략은 체결·종료된 비겹침 거래만",
+          len(select(tr_all, "zone", ("kangaroo", "trendy_kangaroo"))) == 2)
+
+    # (3) 주문 응답 대기 중(busy)에는 스캔이 라이브 거래를 만료시키지 않는다
+    tmp = tempfile.mkdtemp(prefix="coinbot-naked-rv-")
+    try:
+        calls = []
+
+        async def buy(t, krw):
+            calls.append(("buy", t))
+            return True
+
+        async def sell(t, vol):
+            calls.append(("sell", t))
+            return True
+
+        px = {"v": None}
+        ns = NakedStrategy(tmp, feed=None, cfg=_naked_cfg(), buy=buy, sell=sell,
+                           price_of=lambda t: px["v"])
+        ns.process_bar("KRW-BTC", fresh, i, [])
+        lt = ns.live["KRW-BTC"]
+        lt.expire_ts = 0.0
+        lt.busy = True
+        ns.process_bar("KRW-BTC", fresh, i, [])
+        check("주문 응답 대기 중에는 만료 처리 안 함 (고아 포지션 방지)",
+              "KRW-BTC" in ns.live and lt.status == "pending")
+        lt.busy = False
+        lt.expire_ts = time.time() + 3600
+
+        # (4) 게이트가 닫히면 대기 중 매수스톱은 취소, 주문 없음
+        ns.live_enabled = False
+        px["v"] = lt.entry + 0.01
+        asyncio.run(ns.on_tick(can_enter=True))
+        check("게이트 닫힘 -> 대기 매수스톱 취소 (live_disabled)",
+              calls == [] and lt.exit_reason == "live_disabled" and "KRW-BTC" not in ns.live,
+              f"{calls} {lt.exit_reason}")
+
+        # 게이트가 닫혀도 보유 중인 거래는 손절까지 관리
+        ns.live_enabled = True
+        ns.process_bar("KRW-ETH", fresh, i, [])
+        eth = ns.live["KRW-ETH"]
+        px["v"] = eth.entry + 0.01
+        asyncio.run(ns.on_tick(can_enter=True))
+        ns.live_enabled = False
+        px["v"] = eth.stop - 0.01
+        asyncio.run(ns.on_tick(can_enter=True))
+        check("게이트 닫혀도 보유 거래 손절은 나감",
+              calls[-1] == ("sell", "KRW-ETH") and eth.status == "closed", str(calls))
+
+        # (5) 재시작 후 밀린 봉 재생: 종이 매매는 하되 옛 신호로 주문하지 않는다
+        class Feed:
+            def __init__(self, b):
+                self.b = b
+
+            async def get_bars(self, ticker, unit, count=200):
+                return self.b
+
+        old = _bars(ohlc)                      # 2023년 봉 = 오래전에 마감
+        ns2 = NakedStrategy(tmp + "2", feed=Feed(old), cfg=_naked_cfg(), buy=buy, sell=sell,
+                            price_of=lambda t: None)
+        ns2.last_bar["KRW-BTC"] = float(old.t[i - 1])
+        asyncio.run(ns2._scan_ticker("KRW-BTC"))
+        sig_files = glob.glob(os.path.join(tmp + "2", "naked", "signals", "*.jsonl"))
+        sigs = [json.loads(l) for p in sig_files for l in open(p, encoding="utf-8")]
+        check("재생 봉 신호는 종이 매매만 (라이브 주문 없음)",
+              "KRW-BTC" not in ns2.live and len(ns2.book.open.get("KRW-BTC", [])) > 0
+              and sigs and "재생" in sigs[-1]["why"], str([s["why"] for s in sigs]))
+
+        # (6) 받아온 200봉보다 긴 공백 -> 그 종목 종이 거래는 결과를 믿을 수 없어 취소
+        ns3 = NakedStrategy(tmp + "3", feed=Feed(fresh), cfg=_naked_cfg(), buy=buy, sell=sell,
+                            price_of=lambda t: None)
+        stale_tr = Trade("KRW-BTC", _sig(), "zone", 3600)
+        ns3.book.open["KRW-BTC"] = [stale_tr]
+        ns3.last_bar["KRW-BTC"] = float(fresh.t[0]) - 30 * 86400
+        asyncio.run(ns3._scan_ticker("KRW-BTC"))
+        check("데이터 공백 -> 종이 거래 취소 (data_gap)",
+              stale_tr.status == "cancelled" and stale_tr.exit_reason == "data_gap")
+        check("공백 뒤에도 방금 마감된 봉 신호는 라이브", "KRW-BTC" in ns3.live)
+        ns3.live["KRW-ALT"] = Trade("KRW-ALT", _sig(), "zone", 3600, live=True, is_alt=True)
+        check("라이브 거래 종목은 유니버스에 없어도 스캔 대상", "KRW-ALT" in ns3.tickers())
+
+        # (6b) 클럭 타임아웃으로 on_tick 이 취소돼도 접수된 주문의 상태 갱신은 끝난다
+        buys = []
+
+        async def slow_buy(t, krw):
+            buys.append(t)                    # 주문은 접수됐고
+            await asyncio.sleep(0.2)          # 응답(체결 알림 등)이 느리다
+            return True
+
+        ns5 = NakedStrategy(tmp + "5", feed=None, cfg=_naked_cfg(), buy=slow_buy, sell=sell,
+                            price_of=lambda t: px["v"])
+        ns5.process_bar("KRW-BTC", fresh, i, [])
+        px["v"] = ns5.live["KRW-BTC"].entry + 0.01
+
+        async def clock_like():
+            try:
+                await asyncio.wait_for(ns5.on_tick(True), timeout=0.05)
+            except asyncio.TimeoutError:
+                pass
+            await asyncio.sleep(0.3)
+            await ns5.on_tick(True)           # 다음 틱: 이미 체결됐으니 다시 사면 안 됨
+            await asyncio.sleep(0.3)
+
+        asyncio.run(clock_like())
+        check("on_tick 취소돼도 체결 상태 반영 + 이중 매수 없음",
+              buys == ["KRW-BTC"] and ns5.live["KRW-BTC"].status == "open", str(buys))
+
+        async def shutdown_then_tick():
+            await ns5.drain(1.0)
+            px["v"] = ns5.live["KRW-BTC"].stop - 0.01
+            await ns5.on_tick(True)
+
+        calls.clear()
+        asyncio.run(shutdown_then_tick())
+        check("종료 절차(drain) 뒤에는 새 주문을 내지 않음", calls == [], str(calls))
+    finally:
+        for sfx in ("", "2", "3", "5"):
+            shutil.rmtree(tmp + sfx, ignore_errors=True)
+
+    # (7) 봉이 안 생기는 종목에 20초마다 재요청하지 않는다
+    stamp = time.strftime("%Y-%m-%dT%H:00:00", time.gmtime(time.time() - 5 * 3600))
+    candle = types.SimpleNamespace(candle_date_time_utc=stamp, opening_price=1, high_price=1,
+                                   low_price=1, trade_price=1, candle_acc_trade_price=1)
+    n_calls = {"n": 0}
+
+    async def list_minutes(unit, **kw):
+        n_calls["n"] += 1
+        return [candle]
+
+    fake = types.SimpleNamespace(candles=types.SimpleNamespace(list_minutes=list_minutes))
+    feed = CandleFeed(client=fake)
+
+    async def twice():
+        await feed.get_bars("KRW-X", 60)
+        await feed.get_bars("KRW-X", 60)
+
+    asyncio.run(twice())
+    check("캔들 재요청 최소 간격 (거래 없는 종목 스팸 방지)", n_calls["n"] == 1, str(n_calls))
+    check("라이브 스캔 + 자동 백테스트 요청 합이 업비트 한도(초당 10) 이하",
+          CandleFeed.LIVE_PER_SECOND + CandleFeed.BACKTEST_PER_SECOND < 10)
+
+    # (8) 자동 검증: 백테스트가 신선하면 네트워크 없이 표본 외 종이 매매만 합쳐 재평가
+    d = tempfile.mkdtemp(prefix="coinbot-naked-val-")
+    try:
+        cfg = _naked_cfg(NAKED_EXIT_MODE="ladder", NAKED_PATTERNS=("trendy_kangaroo",))
+        rng = np.random.default_rng(5)
+        bt = []
+        for k in range(300):
+            for v in ("zone", "split", "ladder", "three_bar"):
+                bt.append({"ticker": "KRW-X", "pattern": "trendy_kangaroo", "variant": v,
+                           "filled": True, "status": "closed", "signal_ts": k * 36000.0,
+                           "exit_ts": k * 36000.0 + 7200,
+                           "net_ret": rng.normal(0.006 if v == "ladder" else 0.0, 0.01),
+                           "r_net": None, "is_alt": True, "exit_reason": "stop",
+                           "source": "backtest"})
+        save_backtest(d, bt, {"params": backtest_params(cfg)})
+        res = asyncio.run(auto_validate(d, cfg, refresh_days=30, days=180))
+        check("백테스트가 신선하면 재실행 안 함", res["backtest_refreshed"] is False)
+        check("결과를 바꾸는 설정이 바뀌면 백테스트는 낡은 것",
+              backtest_meta(d)["params"] != backtest_params(_naked_cfg(NAKED_MIN_RR=2.0)))
+        check("표본 외 종이 매매 없으면 미통과", res["report"]["passed"] is False)
+        os.makedirs(os.path.join(d, "naked", "trades"), exist_ok=True)
+        with open(os.path.join(d, "naked", "trades", "2026-09-25.jsonl"), "w", encoding="utf-8") as f:
+            for k in range(40):
+                f.write(json.dumps(dict(bt[2], signal_ts=2e7 + k * 36000.0,
+                                        exit_ts=2e7 + k * 36000.0 + 7200,
+                                        net_ret=0.004, source="paper")) + "\n")
+        rep = reevaluate(d, cfg)
+        check("표본 외 종이 매매가 쌓이면 재평가로 통과",
+              rep["passed"] and rep["paper"]["n"] == 40, str(rep["checks"]))
+        check("재평가 리포트로 게이트 열림", check_gate(d, 3, "ladder", ("trendy_kangaroo",))[0])
+        ok, why = check_gate(d, 3, "zone", ("trendy_kangaroo",))
+        check("라이브 설정과 다른 전략을 평가한 리포트면 게이트 닫힘", not ok, why)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # (9) 게이트는 매일 재평가로 닫혔다가 다시 열린다 (설정에서 끈 건 열지 않음)
+    import main as mainmod
+    from config import Config
+    d = tempfile.mkdtemp(prefix="coinbot-gate-")
+    saved = (Config.DRY_RUN, Config.STATE_DIR, Config.NAKED_REQUIRE_VALIDATION)
+    msgs = []
+    try:
+        Config.DRY_RUN, Config.STATE_DIR, Config.NAKED_REQUIRE_VALIDATION = False, d, True
+        bot = mainmod.MainPipeline.__new__(mainmod.MainPipeline)
+
+        async def send(m):
+            msgs.append(m)
+
+        bot.engine = types.SimpleNamespace(notifier=types.SimpleNamespace(send_message=send))
+        bot._spawn = lambda coro, name: coro.close()
+        bot.naked = types.SimpleNamespace(live_enabled=True)
+        bot._naked_live_configured, bot._naked_gate_ok = True, None
+        bot._apply_naked_gate()
+        check("리포트 없으면 실주문 닫힘", bot.naked.live_enabled is False)
+        passing = {"passed": True, "checks": {}, "dsr": 0.97, "pbo": 0.2,
+                   "variant": Config.NAKED_EXIT_MODE, "patterns": list(Config.NAKED_LIVE_PATTERNS)}
+        write_report(d, passing, {})
+        bot._apply_naked_gate()
+        check("검증 통과 리포트가 생기면 다시 열림", bot.naked.live_enabled is True)
+        write_report(d, dict(passing, passed=False, checks={"x": False}), {})
+        bot._apply_naked_gate()
+        check("재평가에서 미통과면 다시 닫힘", bot.naked.live_enabled is False)
+        bot._naked_live_configured = False
+        write_report(d, passing, {})
+        bot._apply_naked_gate()
+        check("설정에서 끈 실주문은 게이트가 켜지 않음", bot.naked.live_enabled is False)
+    finally:
+        Config.DRY_RUN, Config.STATE_DIR, Config.NAKED_REQUIRE_VALIDATION = saved
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import logging
     logging.disable(logging.CRITICAL)   # 점검 결과만 보이도록 로그 억제
@@ -996,6 +1669,11 @@ if __name__ == "__main__":
     test_dry_run_execution()
     test_pbo_dsr()
     test_replay_and_rl()
+    test_price_action_patterns()
+    test_trade_state_machine()
+    test_naked_live_execution()
+    test_naked_infra()
+    test_naked_review_fixes()
 
     print("\n" + "=" * 70)
     print(f"결과: {len(PASS)} PASS / {len(FAIL)} FAIL")
