@@ -1,0 +1,258 @@
+{
+ "timezone": "UTC",
+ "serverTime": 1790238665543,
+ "rateLimits": [
+  {
+   "rateLimitType": "REQUEST_WEIGHT",
+   "interval": "MINUTE",
+   "intervalNum": 1,
+   "limit": 2400
+  },
+  {
+   "rateLimitType": "ORDERS",
+   "interval": "MINUTE",
+   "intervalNum": 1,
+   "limit": 1200
+  }
+ ],
+ "exchangeFilters": [],
+ "symbols": [
+  {
+   "symbol": "BTCUSD_PERP",
+   "pair": "BTCUSD",
+   "contractType": "PERPETUAL",
+   "deliveryDate": 4133404800000,
+   "onboardDate": 1597042800000,
+   "contractStatus": "TRADING",
+   "maintMarginPercent": "2.5000",
+   "requiredMarginPercent": "5.0000",
+   "baseAsset": "BTC",
+   "quoteAsset": "USD",
+   "marginAsset": "BTC",
+   "pricePrecision": 1,
+   "quantityPrecision": 0,
+   "baseAssetPrecision": 8,
+   "quotePrecision": 8,
+   "underlyingType": "COIN",
+   "underlyingSubType": [
+    "PoW"
+   ],
+   "triggerProtect": "0.0500",
+   "liquidationFee": "0.015000",
+   "marketTakeBound": "0.05",
+   "maxMoveOrderLimit": 10000,
+   "contractSize": 100,
+   "equalQtyPrecision": 4,
+   "filters": [
+    {
+     "maxPrice": "4520958",
+     "filterType": "PRICE_FILTER",
+     "minPrice": "1000",
+     "tickSize": "0.1"
+    },
+    {
+     "filterType": "LOT_SIZE",
+     "stepSize": "1",
+     "maxQty": "1000000",
+     "minQty": "1"
+    },
+    {
+     "filterType": "MARKET_LOT_SIZE",
+     "minQty": "1",
+     "stepSize": "1",
+     "maxQty": "60000"
+    },
+    {
+     "filterType": "MAX_NUM_ORDERS",
+     "limit": 200
+    },
+    {
+     "filterType": "MAX_NUM_ALGO_ORDERS",
+     "limit": 20
+    },
+    {
+     "multiplierDown": "0.9500",
+     "multiplierUp": "1.0500",
+     "multiplierDecimal": "4",
+     "filterType": "PERCENT_PRICE"
+    }
+   ],
+   "orderTypes": [
+    "LIMIT",
+    "MARKET",
+    "STOP",
+    "STOP_MARKET",
+    "TAKE_PROFIT",
+    "TAKE_PROFIT_MARKET",
+    "TRAILING_STOP_MARKET"
+   ],
+   "timeInForce": [
+    "GTC",
+    "IOC",
+    "FOK",
+    "GTX"
+   ],
+   "permissionSets": [
+    "GRID"
+   ]
+  },
+  {
+   "symbol": "BTCUSD_260925",
+   "pair": "BTCUSD",
+   "contractType": "CURRENT_QUARTER",
+   "deliveryDate": 1790323200000,
+   "onboardDate": 1774598400000,
+   "contractStatus": "TRADING",
+   "maintMarginPercent": "2.5000",
+   "requiredMarginPercent": "5.0000",
+   "baseAsset": "BTC",
+   "quoteAsset": "USD",
+   "marginAsset": "BTC",
+   "pricePrecision": 1,
+   "quantityPrecision": 0,
+   "baseAssetPrecision": 8,
+   "quotePrecision": 8,
+   "underlyingType": "COIN",
+   "underlyingSubType": [
+    "PoW"
+   ],
+   "triggerProtect": "0.0500",
+   "liquidationFee": "0.010000",
+   "marketTakeBound": "0.05",
+   "maxMoveOrderLimit": 10000,
+   "contractSize": 100,
+   "equalQtyPrecision": 4,
+   "filters": [
+    {
+     "minPrice": "1000",
+     "filterType": "PRICE_FILTER",
+     "tickSize": "0.1",
+     "maxPrice": "4671848"
+    },
+    {
+     "maxQty": "1000000",
+     "minQty": "1",
+     "filterType": "LOT_SIZE",
+     "stepSize": "1"
+    },
+    {
+     "filterType": "MARKET_LOT_SIZE",
+     "minQty": "1",
+     "maxQty": "1000",
+     "stepSize": "1"
+    },
+    {
+     "limit": 200,
+     "filterType": "MAX_NUM_ORDERS"
+    },
+    {
+     "filterType": "MAX_NUM_ALGO_ORDERS",
+     "limit": 20
+    },
+    {
+     "multiplierDown": "0.9500",
+     "multiplierDecimal": "4",
+     "filterType": "PERCENT_PRICE",
+     "multiplierUp": "1.0500"
+    }
+   ],
+   "orderTypes": [
+    "LIMIT",
+    "MARKET",
+    "STOP",
+    "STOP_MARKET",
+    "TAKE_PROFIT",
+    "TAKE_PROFIT_MARKET",
+    "TRAILING_STOP_MARKET"
+   ],
+   "timeInForce": [
+    "GTC",
+    "IOC",
+    "FOK",
+    "GTX"
+   ],
+   "permissionSets": [
+    "GRID"
+   ]
+  },
+  {
+   "symbol": "ETHUSD_PERP",
+   "pair": "ETHUSD",
+   "contractType": "PERPETUAL",
+   "deliveryDate": 4133404800000,
+   "onboardDate": 1597734000000,
+   "contractStatus": "TRADING",
+   "maintMarginPercent": "2.5000",
+   "requiredMarginPercent": "5.0000",
+   "baseAsset": "ETH",
+   "quoteAsset": "USD",
+   "marginAsset": "ETH",
+   "pricePrecision": 2,
+   "quantityPrecision": 0,
+   "baseAssetPrecision": 8,
+   "quotePrecision": 8,
+   "underlyingType": "COIN",
+   "underlyingSubType": [
+    "Layer-1"
+   ],
+   "triggerProtect": "0.0500",
+   "liquidationFee": "0.015000",
+   "marketTakeBound": "0.05",
+   "maxMoveOrderLimit": 10000,
+   "contractSize": 10,
+   "equalQtyPrecision": 4,
+   "filters": [
+    {
+     "filterType": "PRICE_FILTER",
+     "minPrice": "50",
+     "maxPrice": "306159",
+     "tickSize": "0.01"
+    },
+    {
+     "stepSize": "1",
+     "minQty": "1",
+     "filterType": "LOT_SIZE",
+     "maxQty": "1000000"
+    },
+    {
+     "stepSize": "1",
+     "minQty": "1",
+     "maxQty": "500000",
+     "filterType": "MARKET_LOT_SIZE"
+    },
+    {
+     "filterType": "MAX_NUM_ORDERS",
+     "limit": 200
+    },
+    {
+     "filterType": "MAX_NUM_ALGO_ORDERS",
+     "limit": 20
+    },
+    {
+     "multiplierDown": "0.9500",
+     "multiplierUp": "1.0500",
+     "filterType": "PERCENT_PRICE",
+     "multiplierDecimal": "4"
+    }
+   ],
+   "orderTypes": [
+    "LIMIT",
+    "MARKET",
+    "STOP",
+    "STOP_MARKET",
+    "TAKE_PROFIT",
+    "TAKE_PROFIT_MARKET",
+    "TRAILING_STOP_MARKET"
+   ],
+   "timeInForce": [
+    "GTC",
+    "IOC",
+    "FOK",
+    "GTX"
+   ],
+   "permissionSets": [
+    "GRID"
+   ]
+  }
+ ]
+}
