@@ -1,0 +1,29 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadExactlyTwoBinanceParameters",
+      "Effect": "Allow",
+      "Action": ["ssm:GetParameter"],
+      "Resource": [
+        "arn:aws:ssm:REGION:ACCOUNT_ID:parameter/btc-lab/live/binance-api-key",
+        "arn:aws:ssm:REGION:ACCOUNT_ID:parameter/btc-lab/live/binance-api-secret"
+      ]
+    },
+    {
+      "Sid": "DecryptOnlyThoseParametersViaSSM",
+      "Effect": "Allow",
+      "Action": ["kms:Decrypt"],
+      "Resource": "arn:aws:kms:REGION:ACCOUNT_ID:key/CUSTOMER_MANAGED_KEY_ID",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "ssm.REGION.amazonaws.com",
+          "kms:EncryptionContext:PARAMETER_ARN": [
+            "arn:aws:ssm:REGION:ACCOUNT_ID:parameter/btc-lab/live/binance-api-key",
+            "arn:aws:ssm:REGION:ACCOUNT_ID:parameter/btc-lab/live/binance-api-secret"
+          ]
+        }
+      }
+    }
+  ]
+}

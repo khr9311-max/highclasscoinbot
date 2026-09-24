@@ -1,0 +1,55 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "BTC Lab public-data PAPER ONLY EC2 host. No bot startup, credentials or live orders.",
+  "Parameters": {
+    "VpcId": {"Type": "AWS::EC2::VPC::Id"},
+    "PublicSubnetId": {"Type": "AWS::EC2::Subnet::Id", "Description": "Existing subnet in VpcId with a default route to an Internet Gateway."},
+    "Ubuntu2404AmiId": {"Type": "AWS::EC2::Image::Id", "Description": "Verified official Ubuntu Server 24.04 LTS amd64 AMI in this region, with SSM Agent preinstalled."},
+    "InstanceType": {"Type": "String", "Default": "t3.small", "AllowedValues": ["t3.small", "t3.medium"]},
+    "RootVolumeGiB": {"Type": "Number", "Default": 20, "MinValue": 20, "MaxValue": 100}
+  },
+  "Resources": {
+    "PaperRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"Service": "ec2.amazonaws.com"}, "Action": "sts:AssumeRole"}]},
+        "Policies": [{"PolicyName": "SessionManagerOnly", "PolicyDocument": {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": ["ssm:UpdateInstanceInformation", "ssmmessages:CreateControlChannel", "ssmmessages:CreateDataChannel", "ssmmessages:OpenControlChannel", "ssmmessages:OpenDataChannel"], "Resource": "*"}]}}]
+      }
+    },
+    "PaperInstanceProfile": {"Type": "AWS::IAM::InstanceProfile", "Properties": {"Roles": [{"Ref": "PaperRole"}]}},
+    "PaperSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "No inbound access. Outbound HTTPS, Ubuntu package HTTP and AWS time sync only.",
+        "VpcId": {"Ref": "VpcId"},
+        "SecurityGroupIngress": [],
+        "SecurityGroupEgress": [
+          {"IpProtocol": "tcp", "FromPort": 443, "ToPort": 443, "CidrIp": "0.0.0.0/0", "Description": "Public Binance, SSM and package HTTPS"},
+          {"IpProtocol": "tcp", "FromPort": 80, "ToPort": 80, "CidrIp": "0.0.0.0/0", "Description": "Ubuntu apt mirrors; remove after configuring HTTPS-only repositories"},
+          {"IpProtocol": "udp", "FromPort": 123, "ToPort": 123, "CidrIp": "169.254.169.123/32", "Description": "Amazon Time Sync"}
+        ]
+      }
+    },
+    "PaperInstance": {
+      "Type": "AWS::EC2::Instance",
+      "Properties": {
+        "ImageId": {"Ref": "Ubuntu2404AmiId"},
+        "InstanceType": {"Ref": "InstanceType"},
+        "SubnetId": {"Ref": "PublicSubnetId"},
+        "SecurityGroupIds": [{"Ref": "PaperSecurityGroup"}],
+        "IamInstanceProfile": {"Ref": "PaperInstanceProfile"},
+        "MetadataOptions": {"HttpEndpoint": "enabled", "HttpTokens": "required", "HttpPutResponseHopLimit": 1},
+        "BlockDeviceMappings": [{"DeviceName": "/dev/sda1", "Ebs": {"Encrypted": true, "VolumeSize": {"Ref": "RootVolumeGiB"}, "VolumeType": "gp3", "DeleteOnTermination": false}}],
+        "Tags": [{"Key": "Name", "Value": "btc-lab-paper"}, {"Key": "TradingMode", "Value": "PUBLIC_DATA_PAPER_ONLY"}]
+      }
+    },
+    "PaperElasticIp": {"Type": "AWS::EC2::EIP", "Properties": {"Domain": "vpc", "Tags": [{"Key": "Name", "Value": "btc-lab-paper"}]}},
+    "PaperEipAssociation": {"Type": "AWS::EC2::EIPAssociation", "Properties": {"InstanceId": {"Ref": "PaperInstance"}, "AllocationId": {"Fn::GetAtt": ["PaperElasticIp", "AllocationId"]}}}
+  },
+  "Outputs": {
+    "InstanceId": {"Value": {"Ref": "PaperInstance"}},
+    "ElasticIp": {"Value": {"Ref": "PaperElasticIp"}},
+    "InstanceRole": {"Value": {"Ref": "PaperRole"}},
+    "NextStep": {"Value": "Open an SSM Session Manager session; follow btc_lab/deploy/AWS.md. No bot has been installed or started by this template."}
+  }
+}

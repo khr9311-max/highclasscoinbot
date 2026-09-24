@@ -1,0 +1,2 @@
+# Independent public-data paper runner only. No legacy bot/LLM/RL dependencies.
+numpy==2.4.6
