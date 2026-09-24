@@ -133,7 +133,8 @@ def cmd_validate(skip_backtest: bool) -> int:
         _out(format_report(rep))
     db = Database(s.db_path)
     try:
-        paper = paper_trade_returns(db, float(rep["data"]["end"]), s.symbol)
+        paper = paper_trade_returns(db, float(rep["data"]["end"]), s.symbol,
+                                    s.fingerprint(rep["contract"]))
         vr = build_report(s, rep, paper, rep["contract"])
         path = save_report(s, db, vr)
         _out("\n[바이낸스 COIN-M 검증]")

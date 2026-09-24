@@ -44,6 +44,8 @@ class EntryManager:
         ctx, spec, s = self.ctx, self.ctx.contract, self.ctx.settings
         d = sig.direction
         t = TradeRecord(new_trade_id(), ctx.symbol, ctx.mode, d, pattern=sig.pattern)
+        t.validation_fingerprint = s.fingerprint(spec.essentials())
+        t.market_environment = s.binance_env
         ctx.save(t)
         ctx.db.log_transition(ctx.mode, t.trade_id, None, IDLE, "새 거래 슬롯")
         ctx.transition(t, SIGNAL_DETECTED,
@@ -106,6 +108,12 @@ class EntryManager:
                                   {"trade_id": t.trade_id, "position_amt": str(pos.position_amt)})
             await self.cancel(t, "exchange_position_exists", notify=True)
             return
+        if ctx.mode != "paper" and (pos is None or pos.margin_type != "isolated"
+                                     or pos.position_side not in ("BOTH", "")
+                                     or not 0 < pos.leverage <= s.leverage):
+            await self.cancel(t, "account_configuration_mismatch", notify=True)
+            return
+        leverage = pos.leverage if pos is not None and pos.leverage > 0 else s.leverage
         btc = acct.asset(spec.margin_asset)
         equity, avail = btc.margin_balance, btc.available_balance
         ok, why = self.limits.check_new_entry(equity, 0, ctx.now())
@@ -117,7 +125,7 @@ class EntryManager:
         sizing = size_position(SizingInput(
             equity_btc=equity, available_btc=avail, risk_fraction=s.risk_fraction,
             direction=t.direction, entry_price=price, stop_price=float(t.stop_price),
-            leverage=s.leverage, taker_fee=ctx.taker_fee, entry_slippage_bps=s.slippage_bps,
+            leverage=leverage, taker_fee=ctx.taker_fee, entry_slippage_bps=s.slippage_bps,
             stop_slippage_bps=s.stop_slippage_bps, max_exposure_multiple=s.max_exposure_multiple,
             funding_rate=ctx.market.funding_rate or 0.0,
             expected_funding_periods=ctx.funding_periods_estimate(),

@@ -24,7 +24,7 @@ from typing import Any, Callable, Dict, Optional
 
 import numpy as np
 
-from ..config.settings import Settings
+from ..config.settings import ConfigError, Settings
 from ..strategy.ladder import EXIT_VARIANTS
 from .data import Dataset, download_all, load_dataset
 from .metrics import (by_direction, period_stability, summarize_run, top_trade_dependence,
@@ -46,6 +46,7 @@ def sim_config(settings: Settings, variant: str, dirs, equity: float) -> SimConf
     return SimConfig(
         variant=variant, directions=tuple(dirs), fractions=settings.ladder_tp_fractions,
         start_equity_btc=equity, risk_fraction=settings.risk_fraction, leverage=settings.leverage,
+        max_daily_loss_pct=settings.max_daily_loss_pct,
         taker_fee=settings.taker_fee_rate, slippage_bps=settings.slippage_bps,
         stop_slippage_bps=settings.stop_slippage_bps, stop_trigger=settings.stop_trigger_type,
         tp_trigger=settings.tp_trigger_type, valid_bars=settings.entry_valid_bars,
@@ -57,6 +58,7 @@ async def ensure_data(settings: Settings, refresh: bool = False,
                       log: Callable[[str], None] = print) -> Dict[str, Any]:
     from ..exchange.market_data import MarketData
     from ..exchange.rest_client import BinanceRestClient, endpoints
+    check_supported_settings(settings)
     rest_url, _ = endpoints("live")          # 과거 데이터는 항상 실거래 공개 API (키 불필요)
     rest = BinanceRestClient(rest_url)
     try:
@@ -67,11 +69,24 @@ async def ensure_data(settings: Settings, refresh: bool = False,
         await rest.close()
 
 
+def check_supported_settings(settings: Settings) -> None:
+    if (settings.signal_interval, settings.zone_interval) != ("1h", "4h"):
+        raise ConfigError("백테스트 데이터는 1h/4h 전용 - 다른 시간봉으로 검증할 수 없음")
+    if settings.entry_trigger_type != "CONTRACT_PRICE":
+        raise ConfigError("백테스트 진입 트리거는 CONTRACT_PRICE 전용")
+    if settings.stop_price_protect:
+        raise ConfigError("백테스트는 STOP_PRICE_PROTECT=true 지연 발동을 모델링하지 않음")
+
+
 def run_backtest(settings: Settings, ds: Optional[Dataset] = None,
                  reference_equity: float = 1.0, account_equity: Optional[float] = None,
                  log: Callable[[str], None] = print, save: bool = True) -> Dict[str, Any]:
     t0 = time.time()
+    check_supported_settings(settings)
     ds = ds or load_dataset(settings.state_dir, settings.symbol)
+    if ds.symbol != settings.symbol or ds.spec.symbol != settings.symbol or \
+            ds.ltf.period != settings.signal_period_sec or ds.htf.period != settings.zone_period_sec:
+        raise ConfigError("백테스트 데이터 심볼/시간봉이 설정과 다름")
     ltf, htf = ds.ltf, ds.htf
     log(f"데이터: 1h {len(ltf)}봉 ({_d(ltf.t[0])} ~ {_d(ltf.t[-1])}), 4h {len(htf)}봉, "
         f"마크봉 누락 {ds.mark_missing}, 펀딩 {len(ds.funding)}건")
@@ -115,6 +130,7 @@ def run_backtest(settings: Settings, ds: Optional[Dataset] = None,
             "intrabar": "진입+손절 같은 봉 -> 손절, 손절+목표 같은 봉 -> 손절, 진입 봉 목표 불인정, 갭은 시가",
             "bar_close_exit_fill": "다음 봉 시가 + 슬리피지",
             "stop_trigger": settings.stop_trigger_type, "tp_trigger": settings.tp_trigger_type,
+            "daily_loss_limit_pct": settings.max_daily_loss_pct,
             "fees": {"taker": settings.taker_fee_rate}, "slippage_bps": settings.slippage_bps,
             "stop_slippage_bps": settings.stop_slippage_bps,
             "funding": "실제 펀딩 이력(마크가 x 비율), 펀딩 시각 보유 시",

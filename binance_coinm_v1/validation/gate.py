@@ -30,23 +30,30 @@ import numpy as np
 from ..config.settings import STRATEGY_VERSION, Settings
 
 SOURCE = "binance_coinm_v1"
+REPORT_VERSION = 2
 
 
-def paper_trade_returns(db: Any, after_ts: float, symbol: str) -> List[Dict[str, Any]]:
+def paper_trade_returns(db: Any, after_ts: float, symbol: str,
+                        fingerprint: Optional[str] = None) -> List[Dict[str, Any]]:
     """백테스트 데이터 끝 이후 신호로 생긴 종이 거래 (체결·종료된 것, 채택된 고아 제외)."""
     out = []
+    if not fingerprint or _number(after_ts) is None:
+        return out
     for t in db.closed_positions("paper"):
         if t.get("symbol") != symbol or t.get("adopted") or not t.get("entry_avg_price"):
             continue
+        if t.get("validation_fingerprint") != fingerprint or t.get("market_environment") != "live":
+            continue
         sig = t.get("signal") or {}
-        if float(sig.get("close_time", 0)) <= after_ts:
+        if (_number(sig.get("close_time")) or 0) <= after_ts:
             continue
-        eq = t.get("equity_at_entry_btc") or 0.0
+        eq = _number(t.get("equity_at_entry_btc")) or 0.0
         acc = t.get("accounting") or {}
-        if eq <= 0:
+        net = _number(acc.get("net_pnl_btc"))
+        if eq <= 0 or net is None:
             continue
-        out.append({"trade_id": t["trade_id"], "net_btc": float(acc.get("net_pnl_btc", 0.0)),
-                    "ret": float(acc.get("net_pnl_btc", 0.0)) / eq,
+        out.append({"trade_id": t["trade_id"], "net_btc": net,
+                    "ret": net / eq, "fingerprint": fingerprint, "market_environment": "live",
                     "direction": t.get("direction"), "closed_at": t.get("closed_at")})
     return out
 
@@ -58,34 +65,39 @@ def build_report(settings: Settings, backtest: Dict[str, Any], paper: Sequence[D
     tr = backtest.get("trial") or {}
     wf = backtest.get("walk_forward") or {}
     fp_now = settings.fingerprint(contract_essentials)
+    paper = [p for p in paper if p.get("fingerprint") == fp_now
+             and p.get("market_environment") == "live"
+             and _number(p.get("ret")) is not None and _number(p.get("net_btc")) is not None]
     paper_n = len(paper)
     paper_mean = float(np.mean([p["ret"] for p in paper])) if paper else None
-    dd = s.get("max_drawdown")
-    dsr, pbo = tr.get("dsr"), tr.get("pbo")
-    folds = int(wf.get("evaluated_folds") or 0)
+    dd = _number(s.get("max_drawdown"))
+    dsr, pbo = _number(tr.get("dsr")), _number(tr.get("pbo"))
+    folds = _number(wf.get("evaluated_folds")) or 0
     checks = {
         f"백테스트 거래 {settings.validation_min_trades}건 이상":
-            (s.get("n") or 0) >= settings.validation_min_trades,
+            (_number(s.get("n")) or 0) >= settings.validation_min_trades,
         "비용 후 기대값 > 0":
-            (s.get("avg_return") or 0) > 0 and (s.get("expectancy_btc") or 0) > 0,
+            (_number(s.get("avg_return")) or 0) > 0 and (_number(s.get("expectancy_btc")) or 0) > 0,
         f"최대낙폭 <= {settings.validation_max_dd_pct:g}%":
-            dd is not None and dd * 100 <= settings.validation_max_dd_pct,
+            dd is not None and 0 <= dd * 100 <= settings.validation_max_dd_pct,
         f"DSR >= {settings.validation_min_dsr:g}":
-            dsr is not None and not _nan(dsr) and dsr >= settings.validation_min_dsr,
+            dsr is not None and settings.validation_min_dsr <= dsr <= 1,
         f"PBO <= {settings.validation_max_pbo:g}":
-            pbo is not None and not _nan(pbo) and pbo <= settings.validation_max_pbo,
+            pbo is not None and 0 <= pbo <= settings.validation_max_pbo,
         "워크포워드 OOS 평균 > 0 & 양수 구간 절반 이상":
-            (wf.get("default_oos_avg_return") or 0) > 0 and folds > 0 and
-            (wf.get("default_positive_folds") or 0) >= math.ceil(folds / 2),
+            (_number(wf.get("default_oos_avg_return")) or 0) > 0 and folds > 0 and
+            math.ceil(folds / 2) <= (_number(wf.get("default_positive_folds")) or 0) <= folds,
         f"표본 외 종이매매 {settings.validation_min_paper_trades}건 이상":
             paper_n >= settings.validation_min_paper_trades,
-        "표본 외 종이매매 평균 > 0": paper_mean is not None and paper_mean > 0,
+        "표본 외 종이매매 평균 > 0": _number(paper_mean) is not None and paper_mean > 0,
         "리포트가 바이낸스 COIN-M 데이터": backtest.get("symbol") == settings.symbol and
             bool(backtest.get("contract")),
         "설정 지문 일치": backtest.get("fingerprint") == fp_now,
     }
     return {
         "source": SOURCE,
+        "report_version": REPORT_VERSION,
+        "validation_policy": settings.validation_policy(),
         "generated_at": now,
         "fingerprint": fp_now,
         "strategy_version": STRATEGY_VERSION,
@@ -103,11 +115,12 @@ def build_report(settings: Settings, backtest: Dict[str, Any], paper: Sequence[D
     }
 
 
-def _nan(x: Any) -> bool:
+def _number(x: Any) -> Optional[float]:
     try:
-        return math.isnan(float(x))
-    except (TypeError, ValueError):
-        return True
+        value = float(x)
+        return value if math.isfinite(value) and not isinstance(x, bool) else None
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def save_report(settings: Settings, db: Any, report: Dict[str, Any]) -> str:
@@ -133,13 +146,23 @@ class ValidationGate:
             return False, "바이낸스 검증 리포트 없음 (python -m binance_coinm_v1 validate)"
         if rep.get("source") != SOURCE:
             return False, "리포트 출처가 바이낸스 COIN-M V1 이 아님"
-        age_d = (self.clock() - float(rep.get("generated_at", 0))) / 86400
+        if rep.get("report_version") != REPORT_VERSION:
+            return False, "검증 리포트 형식이 오래됨 - 재검증 필요"
+        generated = _number(rep.get("generated_at"))
+        now = self.clock()
+        if generated is None or generated <= 0 or generated > now:
+            return False, "검증 리포트 생성 시각 오류"
+        age_d = (now - generated) / 86400
         if age_d > self.settings.validation_max_age_days:
             return False, f"검증 리포트가 오래됨 ({age_d:.1f}일 > {self.settings.validation_max_age_days:g}일)"
         fp = self.settings.fingerprint(self.contract_essentials)
         if rep.get("fingerprint") != fp:
             return False, "설정/계약 지문이 리포트와 다름 - 재검증 필요"
-        if not rep.get("passed"):
-            failed = [k for k, v in (rep.get("checks") or {}).items() if not v]
+        if rep.get("validation_policy") != self.settings.validation_policy():
+            return False, "검증 기준이 변경됨 - 재검증 필요"
+        checks = rep.get("checks")
+        if rep.get("passed") is not True or not isinstance(checks, dict) or not checks or \
+                any(v is not True for v in checks.values()):
+            failed = [k for k, v in checks.items() if v is not True] if isinstance(checks, dict) else ["검증 항목 형식 오류"]
             return False, "검증 미통과: " + ", ".join(failed)
         return True, f"검증 통과 ({age_d:.1f}일 전)"

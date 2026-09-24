@@ -1,6 +1,7 @@
 """12단계: 바이낸스 전용 검증 게이트 (기본 닫힘, 업비트 결과 무관)."""
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -38,12 +39,13 @@ def good_backtest(settings, **over):
 
 
 def paper(n=40, mean=0.001):
-    return [{"trade_id": str(i), "net_btc": mean, "ret": mean, "direction": 1, "closed_at": NOW}
+    return [{"trade_id": str(i), "net_btc": mean, "ret": mean, "direction": 1, "closed_at": NOW,
+             "fingerprint": Settings.build().fingerprint(ESS), "market_environment": "live"}
             for i in range(n)]
 
 
 def test_all_checks_pass_opens_gate(db):
-    s = Settings.build()
+    s = Settings.build(state_dir=str(Path(db.path).parent))
     rep = build_report(s, good_backtest(s), paper(), ESS, now=NOW)
     assert rep["passed"], rep["checks"]
     save_report(s, db, rep)
@@ -66,7 +68,7 @@ def test_all_checks_pass_opens_gate(db):
     ({"symbol": "KRW-BTC"}, {}, "바이낸스"),
 ])
 def test_each_failed_check_keeps_gate_closed(db, over, paper_kw, failed):
-    s = Settings.build()
+    s = Settings.build(state_dir=str(Path(db.path).parent))
     rep = build_report(s, good_backtest(s, **over), paper(**paper_kw), ESS, now=NOW)
     assert not rep["passed"]
     assert any(failed in k for k, v in rep["checks"].items() if not v)
@@ -76,7 +78,7 @@ def test_each_failed_check_keeps_gate_closed(db, over, paper_kw, failed):
 
 
 def test_gate_closed_without_report_stale_or_changed_settings(db):
-    s = Settings.build()
+    s = Settings.build(state_dir=str(Path(db.path).parent))
     gate = ValidationGate(s, db, ESS, clock=lambda: NOW)
     assert gate.check()[0] is False                                    # 리포트 없음
     save_report(s, db, build_report(s, good_backtest(s), paper(), ESS, now=NOW))
@@ -99,7 +101,7 @@ def test_upbit_passed_report_is_ignored(tmp_path, db):
 
 
 def test_live_gate_uses_validation_gate(db):
-    s = live_settings()
+    s = live_settings(state_dir=str(Path(db.path).parent))
     vg = ValidationGate(s, db, ESS, clock=lambda: NOW)
     gate = LiveOrderGate(s, LIVE_REST, vg.check)
     assert not gate.is_open()                                          # 리포트 없음 -> 닫힘
@@ -110,10 +112,12 @@ def test_live_gate_uses_validation_gate(db):
 def test_paper_sample_is_out_of_sample_only(db):
     base = {"symbol": "BTCUSD_PERP", "mode": "paper", "direction": 1, "state": "CLOSED",
             "entry_avg_price": 80000.0, "equity_at_entry_btc": 0.01, "closed_at": NOW,
-            "created_at": NOW, "accounting": {"net_pnl_btc": 0.0001}}
+            "created_at": NOW, "accounting": {"net_pnl_btc": 0.0001},
+            "validation_fingerprint": Settings.build().fingerprint(ESS), "market_environment": "live"}
     db.upsert_position(dict(base, trade_id="a" * 10, signal={"close_time": NOW - 100}))
     db.upsert_position(dict(base, trade_id="b" * 10, signal={"close_time": NOW - 10 ** 7}))
     db.upsert_position(dict(base, trade_id="c" * 10, signal={"close_time": NOW - 50}, adopted=True))
-    out = paper_trade_returns(db, after_ts=NOW - 10 ** 6, symbol="BTCUSD_PERP")
+    out = paper_trade_returns(db, after_ts=NOW - 10 ** 6, symbol="BTCUSD_PERP",
+                              fingerprint=Settings.build().fingerprint(ESS))
     assert [p["trade_id"] for p in out] == ["a" * 10]                 # 표본 내·고아 채택 제외
     assert out[0]["ret"] == pytest.approx(0.01)

@@ -103,6 +103,8 @@ class TradeRecord:
     sizing: Dict[str, Any] = field(default_factory=dict)
     adopted: bool = False
     equity_at_entry_btc: Optional[float] = None
+    validation_fingerprint: Optional[str] = None
+    market_environment: Optional[str] = None
     error: Optional[str] = None
 
     # ---- 편의 ----

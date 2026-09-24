@@ -319,18 +319,29 @@ class Bot:
 
     # ------------------------------------------------------------------ 실행
     async def run(self, duration: Optional[float] = None) -> None:
+        tasks = []
+        try:
+            await self._run(tasks, duration)
+        finally:
+            await self.shutdown(tasks)
+
+    async def _run(self, tasks: list, duration: Optional[float]) -> None:
         s = self.settings
         await self.setup()
         await self.notifier.start()
+        snap = await self.snapshot()
+        logger.info("시작 equity %.8f BTC (= %.2f USD / %.0f KRW) · 상태 %s",
+                    snap["equity_btc"], snap["equity_usd"] or 0, snap["equity_krw"] or 0,
+                    self.engine.state)
         self.market_stream = MarketStream(self.ws_base, s.symbol, s.signal_interval,
                                           self._on_market_event, connect=self.ws_connect,
                                           stale_after=s.market_ws_stale_sec,
                                           on_connected=self._on_market_connected,
                                           on_disconnected=self._on_market_disconnected)
-        tasks = [asyncio.create_task(self.market_stream.run(self.stop_event), name="market_ws"),
+        tasks.extend([asyncio.create_task(self.market_stream.run(self.stop_event), name="market_ws"),
                  asyncio.create_task(self._bar_loop(), name="bars"),
                  asyncio.create_task(self._event_pump(), name="events"),
-                 asyncio.create_task(self._periodic(), name="periodic")]
+                 asyncio.create_task(self._periodic(), name="periodic")])
         if not self.paper:
             lk = ListenKeyManager(self.gateway)
             self.user_stream = UserDataStream(self.ws_base, lk, self._sink,
@@ -339,21 +350,19 @@ class Bot:
             tasks.append(asyncio.create_task(self.user_stream.run(self.stop_event), name="user_ws"))
             tasks.append(asyncio.create_task(self.user_stream.keepalive_loop(self.stop_event),
                                              name="listenkey"))
-        snap = await self.snapshot()
-        logger.info("시작 equity %.8f BTC (= %.2f USD / %.0f KRW) · 상태 %s",
-                    snap["equity_btc"], snap["equity_usd"] or 0, snap["equity_krw"] or 0,
-                    self.engine.state)
         self._bar_evt.set()                       # 시작 즉시 최근 마감 봉 확인 (진입은 신선한 봉만)
-        try:
-            if duration is not None:
-                try:
-                    await asyncio.wait_for(self.stop_event.wait(), timeout=duration)
-                except asyncio.TimeoutError:
-                    pass
-            else:
-                await self.stop_event.wait()
-        finally:
-            await self.shutdown(tasks)
+        stopper = asyncio.create_task(self.stop_event.wait(), name="stop_wait")
+        tasks.append(stopper)
+        done, _ = await asyncio.wait(tasks, timeout=duration, return_when=asyncio.FIRST_COMPLETED)
+        if self.stop_event.is_set() or not done:
+            return
+        failed = next(task for task in done if task is not stopper)
+        self.engine.trading_allowed = False
+        self.engine.halts["runtime"] = f"필수 작업 종료: {failed.get_name()}"
+        self.notifier.notify("critical", self.engine.halts["runtime"], critical=True)
+        # Propagate failures so a supervisor can restart the process.
+        failed.result()
+        raise RuntimeError(self.engine.halts["runtime"])
 
     async def shutdown(self, tasks=()) -> None:
         self.stop_event.set()

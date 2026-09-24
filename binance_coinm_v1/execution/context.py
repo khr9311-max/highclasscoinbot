@@ -51,6 +51,10 @@ class MarketState:
     index: Optional[float] = None
     ts_ms: int = 0
     updated_mono: Optional[float] = None
+    last_mono: Optional[float] = None
+    mark_mono: Optional[float] = None
+    last_ts_ms: int = 0
+    mark_ts_ms: int = 0
     funding_rate: Optional[float] = None
     next_funding_ms: Optional[int] = None
 
@@ -58,7 +62,9 @@ class MarketState:
         return self.mark if trigger_type == "MARK_PRICE" else self.last
 
     def age(self, now_mono: float) -> float:
-        return float("inf") if self.updated_mono is None else now_mono - self.updated_mono
+        if self.last_mono is None or self.mark_mono is None:
+            return float("inf")
+        return max(now_mono - self.last_mono, now_mono - self.mark_mono)
 
 
 class ExecutionContext:

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,7 +27,7 @@ LIVE_CONFIRMATION_PHRASE = "I_UNDERSTAND_LIVE_TRADING"
 
 # 전략 코드(신호·청산 규칙)가 바뀌면 올린다. 검증 리포트의 설정 지문에 들어가므로
 # 규칙을 바꾸면 옛 검증 결과로는 실거래 게이트가 열리지 않는다.
-STRATEGY_VERSION = "trendy_kangaroo-v1.0"
+STRATEGY_VERSION = "trendy_kangaroo-v1.1"
 
 TRIGGER_TYPES = ("MARK_PRICE", "CONTRACT_PRICE")
 BINANCE_INTERVALS = ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d")
@@ -114,9 +115,12 @@ def _to_bool(v: Any) -> bool:
 
 def _to_float(name: str, v: Any) -> float:
     try:
-        return float(v)
+        value = float(v)
     except (TypeError, ValueError):
         raise ConfigError(f"{name}: 숫자가 아님 ({v!r})") from None
+    if not math.isfinite(value):
+        raise ConfigError(f"{name}: 유한한 숫자가 필요함")
+    return value
 
 
 def _to_int(name: str, v: Any) -> int:
@@ -124,7 +128,7 @@ def _to_int(name: str, v: Any) -> int:
         f = float(v)
     except (TypeError, ValueError):
         raise ConfigError(f"{name}: 정수가 아님 ({v!r})") from None
-    if f != int(f):
+    if not math.isfinite(f) or f != int(f):
         raise ConfigError(f"{name}: 정수가 아님 ({v!r})")
     return int(f)
 
@@ -316,6 +320,11 @@ class Settings:
 
     # ------------------------------------------------------------------
     def validate(self) -> None:
+        for name in self.__dataclass_fields__:
+            value = getattr(self, name)
+            values = value if isinstance(value, tuple) else (value,)
+            if any(isinstance(x, float) and not math.isfinite(x) for x in values):
+                raise ConfigError(f"{name}: 유한한 숫자가 필요함")
         if self.binance_env not in ("live", "testnet"):
             raise ConfigError(f"BINANCE_ENV 는 live/testnet: {self.binance_env!r}")
         if self.execution_mode not in ("paper", "testnet", "live"):
@@ -383,6 +392,16 @@ class Settings:
             raise ConfigError("RECV_WINDOW_MS 는 1000~60000")
         if not 1 <= self.entry_max_attempts <= 3:
             raise ConfigError("ENTRY_MAX_ATTEMPTS 는 1~3")
+        if self.validation_min_trades < 1 or self.validation_min_paper_trades < 1:
+            raise ConfigError("검증 거래 표본 수는 1 이상")
+        if not 0 <= self.validation_min_dsr <= 1 or not 0 <= self.validation_max_pbo <= 1:
+            raise ConfigError("DSR/PBO 검증 기준은 0~1")
+        if not 0 < self.validation_max_dd_pct <= 100:
+            raise ConfigError("검증 최대낙폭은 0 초과 100 이하")
+        if min(self.validation_max_age_days, self.reconcile_interval_sec, self.market_ws_stale_sec) <= 0:
+            raise ConfigError("검증 유효기간·대사 간격·시세 제한은 0 초과")
+        if self.restart_pending_grace_sec < 0:
+            raise ConfigError("재시작 유예 시간은 0 이상")
 
     # ------------------------------------------------------------------
     @property
@@ -444,12 +463,20 @@ class Settings:
             "tp_trigger_type": self.tp_trigger_type,
             "entry_trigger_type": self.entry_trigger_type,
             "risk_per_trade_pct": self.risk_per_trade_pct,
+            "max_daily_loss_pct": self.max_daily_loss_pct,
+            "max_exposure_multiple": self.max_exposure_multiple,
+            "liq_guard_min_ratio": self.liq_guard_min_ratio,
+            "stop_price_protect": self.stop_price_protect,
             "leverage": self.leverage,
             "margin_type": self.margin_type,
             "taker_fee_rate": self.taker_fee_rate,
+            "maker_fee_rate": self.maker_fee_rate,
             "slippage_bps": self.slippage_bps,
             "stop_slippage_bps": self.stop_slippage_bps,
         }
+
+    def validation_policy(self) -> Dict[str, Any]:
+        return {k: getattr(self, k) for k in self.__dataclass_fields__ if k.startswith("validation_")}
 
     def fingerprint(self, contract_essentials: Optional[Mapping[str, Any]] = None) -> str:
         payload = {"strategy": self.strategy_params(),

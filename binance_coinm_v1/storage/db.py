@@ -159,7 +159,7 @@ CREATE TABLE IF NOT EXISTS kv (
 """
 
 TERMINAL_ORDER_STATUSES = {"FILLED", "CANCELED", "EXPIRED", "REJECTED", "NOT_FOUND",
-                           "FINISHED", "NOT_PLACED"}
+                           "FINISHED", "NOT_PLACED", "EXPIRED_IN_MATCH"}
 
 
 class Database:
@@ -195,6 +195,21 @@ class Database:
     def upsert_order(self, rec: Dict[str, Any]) -> None:
         now = time.time()
         cur = self.get_order(rec["client_order_id"])
+        if cur:
+            from decimal import Decimal
+            rec = dict(rec)
+            old_qty = Decimal(str(cur.get("executed_qty") or 0))
+            new_qty = Decimal(str(rec.get("executed_qty") or 0))
+            if "executed_qty" in rec:
+                rec["executed_qty"] = max(old_qty, new_qty)
+            old_status, new_status = cur.get("status"), rec.get("status")
+            rank = {"NEW": 0, "PARTIALLY_FILLED": 1, "TRIGGERING": 1, "TRIGGERED": 2}
+            if new_status and (old_status in TERMINAL_ORDER_STATUSES - {"NOT_FOUND", "NOT_PLACED"} and
+                               new_status not in TERMINAL_ORDER_STATUSES or
+                               rank.get(new_status, 3) < rank.get(old_status, -1)):
+                rec.pop("status", None)
+            if new_qty < old_qty:
+                rec.pop("avg_price", None)
         row = dict(cur or {})
         row.update({k: v for k, v in rec.items() if v is not None or k not in row})
         row.setdefault("created_at", now)

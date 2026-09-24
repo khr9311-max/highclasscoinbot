@@ -90,6 +90,8 @@ class RecoveryManager:
             self._force_state(old, CLOSED, "복구: 중복 활성 기록 정리")
             act(f"superseded:{old.trade_id}")
         eng.trade = t
+        if t is not None and t.adopted:
+            eng.halts["orphan"] = "고아 포지션 채택 - 사람 확인 전 신규 진입 차단"
 
         # ---- 10. 오래된 진입 ----
         if t is not None and not t.entry_avg_price:
@@ -128,6 +130,16 @@ class RecoveryManager:
                     act(f"pending_cancelled:{t.trade_id}")
             eng.trade = t if t is not None and t.state != CLOSED else None
             t = eng.trade
+            # 진입 확정/보호 과정에서 주문과 포지션이 바뀔 수 있다. 최초 스냅샷으로
+            # 다시 손절을 만들거나 이미 닫힌 포지션을 채택하지 않는다.
+            try:
+                pos = await ctx.gw.get_position(ctx.symbol)
+                qty = pos.qty if pos else Decimal(0)
+                algos = await ctx.gw.get_open_algo_orders(ctx.symbol)
+            except ExchangeError as e:
+                issue(f"exchange_query_failed:{e}")
+                self._finish(rep)
+                return rep
 
         # ---- 7 / 11. 포지션 대사 ----
         if qty != 0:
@@ -157,8 +169,7 @@ class RecoveryManager:
                         act(f"protected:{t.trade_id}")
                     elif t.state in HOLDING_STATES + (RECOVERY_REQUIRED, ERROR):
                         # ---- 9. 손절 누락 ----
-                        have = [a for a in algos if ids.trade_of(a.client_id) == t.trade_id
-                                and a.order_type == "STOP_MARKET" and a.is_open]
+                        have = [a for a in algos if eng.protection.is_valid_stop(t, a)]
                         if not have:
                             issue(f"missing_stop:{t.trade_id}")
                             if t.state not in (RECOVERY_REQUIRED,):
@@ -172,6 +183,9 @@ class RecoveryManager:
                                 self._force_state(t, "PROTECTED", "복구: 손절 확인")
                                 eng.protection.refresh_state(t)
                             await eng.protection.place_tps(t)
+                            eng.protection.refresh_state(t)
+                    await ctx.sync_fills(t)
+                    ctx.recompute_accounting(t)
                     ctx.save(t)
         else:
             if t is not None and t.entry_avg_price and t.state in POSITION_STATES + (RECOVERY_REQUIRED, ERROR):
@@ -196,8 +210,11 @@ class RecoveryManager:
                 continue
             if eng.trade is None or tid != eng.trade.trade_id:
                 try:
-                    await ctx.cancel(o.client_id, o.is_algo)
-                    act(f"orphan_order_cancelled:{o.client_id}")
+                    result = await ctx.cancel(o.client_id, o.is_algo)
+                    if result.is_terminal:
+                        act(f"orphan_order_cancelled:{o.client_id}")
+                    else:
+                        issue(f"orphan_cancel_failed:{o.client_id}:{result.status}")
                 except Exception as e:
                     issue(f"orphan_cancel_failed:{o.client_id}:{e}")
         if foreign:
@@ -233,8 +250,11 @@ class RecoveryManager:
         ctx, eng = self.ctx, self.engine
         critical = [i for i in rep["issues"] if i.startswith(("exchange_query_failed",
                                                               "direction_mismatch",
-                                                              "entry_status_unknown"))]
-        eng.trading_allowed = not critical and "recovery" not in eng.halts
+                                                              "entry_status_unknown",
+                                                              "order_requery_failed",
+                                                              "orphan_cancel_failed",
+                                                              "order_unknown"))]
+        eng.trading_allowed = not critical and not eng.halts
         rep["trading_allowed"] = eng.trading_allowed
         rep["halts"] = dict(eng.halts)
         self.last_report = rep
@@ -302,12 +322,16 @@ class RecoveryManager:
             await eng.exits.close(t, "orphan_close" if not too_far else "orphan_beyond_stop",
                                   emergency=True)
         else:
-            # 이 봇의 손절이 이미 있으면 그대로 쓰고, 없으면 정책 손절을 건다
+            # 새 거래 ID 소유의 손절을 먼저 확인한 뒤 8단계에서 옛 주문을 정리한다.
+            # 옛 ID를 그대로 참조하면 고아 주문 정리가 유일한 손절까지 취소한다.
             have = [a for a in algos if a.order_type == "STOP_MARKET" and a.is_open
-                    and a.close_position]
-            if have and ids.trade_of(have[-1].client_id):
-                t.orders["stop"] = have[-1].client_id
-                self._force_state(t, "PROTECTED", "고아 포지션: 기존 손절 사용")
-            else:
-                await eng.protection.protect(t, "고아 포지션 보호 손절")
+                    and a.close_position and a.side == t.side_close
+                    and a.working_type == s.stop_trigger_type and a.trigger_price
+                    and ids.trade_of(a.client_id)]
+            if have:
+                tighter = max([t.stop_price] + [a.trigger_price for a in have], key=lambda p: d * p)
+                t.init_stop = t.stop_price = tighter
+                t.logic["stop"] = tighter
+                ctx.save(t)
+            await eng.protection.protect(t, "고아 포지션 보호 손절")
         return t

@@ -76,9 +76,17 @@ class ProtectionManager:
         except ExchangeError as e:
             logger.error("[%s] 손절 존재 확인 실패: %s", t.trade_id, e)
             return FAILED, cid
-        if v.status in ("NEW", "TRIGGERING", "TRIGGERED", "FINISHED"):
+        if v.status in ("NEW", "TRIGGERING"):
             return OK, cid
         return FAILED, cid
+
+    def is_valid_stop(self, t: TradeRecord, order: Any) -> bool:
+        return (ids.trade_of(order.client_id) == t.trade_id and order.symbol == t.symbol
+                and order.order_type == "STOP_MARKET" and order.is_open
+                and order.close_position and order.side == t.side_close
+                and order.working_type == self.ctx.settings.stop_trigger_type
+                and order.trigger_price is not None
+                and t.direction * order.trigger_price >= t.direction * float(t.stop_price))
 
     async def protect(self, t: TradeRecord, reason: str = "보호 손절 생성") -> bool:
         ctx = self.ctx
@@ -126,14 +134,46 @@ class ProtectionManager:
         t.tp_plan = [[lvl, str(q), t.targets[lvl]] for lvl, q in plan]
         ctx.save(t)
         for lvl, q in plan:
+            if t.state in (CLOSED, CLOSING) or t.qty_open_d <= 0:
+                return
             if lvl in t.tp_filled:
                 continue
             key = f"tp{lvl}"
-            cur = t.orders.get(key)
-            if cur:
-                row = ctx.db.get_order(cur)
-                if row and row["status"] in ("NEW", "PENDING_SUBMIT", "TRIGGERING", "UNKNOWN"):
+            # 누락된 WS 체결을 먼저 조회한다. 취소/만료된 부분 체결도 누적 차감해야
+            # 재시작 때 같은 목표를 두 번 청산하거나 잔여량보다 크게 재발주하지 않는다.
+            filled = Decimal(0)
+            pending = False
+            for row in ctx.db.list_orders(ctx.mode, trade_id=t.trade_id):
+                parsed = ids.parse(row["client_order_id"])
+                if not parsed or parsed[1:3] != ("TP", lvl):
                     continue
+                if row["status"] not in ("REJECTED", "NOT_PLACED", "NOT_FOUND"):
+                    try:
+                        st = await ctx.resolve(row["client_order_id"], bool(row["is_algo"]))
+                        if not st.found:
+                            # 과거에 존재했던 주문의 조회 불가는 미발주 증거가 아니다.
+                            pending = True
+                        else:
+                            ctx.store_state(st)
+                            pending |= not st.is_terminal
+                            # FINISHED인데 actualQty가 없으면 체결량을 확정할 수 없다.
+                            pending |= st.status == "FINISHED" and st.executed_qty == 0
+                    except ExchangeError as e:
+                        pending = True
+                        logger.warning("TP 체결 대사 보류 %s: %s", row["client_order_id"], e)
+                row = ctx.db.get_order(row["client_order_id"])
+                filled += Decimal(str(row.get("executed_qty") or 0))
+            if filled >= q:
+                t.tp_filled.append(lvl)
+                if t.logic:
+                    lg = PositionLogic.from_dict(t.logic)
+                    lg.on_tp_filled(lvl)
+                    t.logic = lg.to_dict()
+                ctx.save(t)
+                continue
+            if pending:
+                continue
+            q -= filled
             if q > t.qty_open_d:
                 q = t.qty_open_d
             if q <= 0:
@@ -215,8 +255,7 @@ class ProtectionManager:
         except ExchangeError as e:
             logger.warning("손절 확인 실패: %s", e)
             return False
-        mine = [a for a in algos if ids.trade_of(a.client_id) == t.trade_id
-                and a.order_type == "STOP_MARKET" and a.is_open]
+        mine = [a for a in algos if self.is_valid_stop(t, a)]
         if mine:
             t.orders["stop"] = mine[-1].client_id
             return True

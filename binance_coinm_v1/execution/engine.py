@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from collections import deque
 from decimal import Decimal
@@ -93,10 +94,10 @@ class Engine:
             self.trade = None
 
     def _entry_gate(self):
-        if not self.trading_allowed:
-            return False, "복구 미완료 (trading_allowed=False)"
         if self.halts:
             return False, "; ".join(self.halts.values())
+        if not self.trading_allowed:
+            return False, "복구 미완료 (trading_allowed=False)"
         age = self.ctx.market.age(self.ctx.mono())
         if age > self.settings.market_ws_stale_sec:
             return False, f"transient: 시세 지연 {age:.0f}s"
@@ -155,10 +156,12 @@ class Engine:
             if ev.symbol and ev.symbol != ctx.symbol:
                 return
             changed = ctx.tracker.apply_algo(ev)
-            if ctx.db.get_order(ev.client_algo_id):
+            if changed and ctx.db.get_order(ev.client_algo_id):
                 ctx.db.upsert_order({"client_order_id": ev.client_algo_id, "status": ev.status,
                                      "exchange_order_id": ev.algo_id,
-                                     "actual_order_id": ev.actual_order_id})
+                                     "actual_order_id": ev.actual_order_id,
+                                     "executed_qty": ev.actual_qty,
+                                     "avg_price": ev.avg_price or None})
             if t is None or ids.trade_of(ev.client_algo_id) != t.trade_id or not changed:
                 return
             p = ids.parse(ev.client_algo_id)
@@ -220,7 +223,13 @@ class Engine:
         ctx = self.ctx
         if t.state == CLOSED:
             return
-        if level not in t.tp_filled:
+        filled = sum((Decimal(str(row.get("executed_qty") or 0))
+                      for row in ctx.db.list_orders(ctx.mode, trade_id=t.trade_id)
+                      if (ids.parse(row["client_order_id"]) or (None, None, None))[1:3]
+                      == ("TP", level)), Decimal(0))
+        planned = dict(self.protection.plan_tps(t)).get(level, Decimal(0))
+        # A terminal child market order may represent only the remaining quantity.
+        if filled >= planned > 0 and level not in t.tp_filled:
             t.tp_filled.append(level)
             if t.logic:
                 lg = PositionLogic.from_dict(t.logic)
@@ -269,10 +278,17 @@ class Engine:
                         funding_rate: Optional[float] = None,
                         next_funding_ms: Optional[int] = None) -> None:
         m = self.ctx.market
-        if last is not None:
-            m.last = float(last)
-        if mark is not None:
-            m.mark = float(mark)
+        stamp = int(ts_ms) if ts_ms is not None else self.ctx.now_ms()
+        for name, value in (("last", last), ("mark", mark)):
+            if value is None or not math.isfinite(float(value)) or float(value) <= 0:
+                continue
+            if stamp < getattr(m, f"{name}_ts_ms"):
+                continue
+            setattr(m, name, float(value))
+            setattr(m, f"{name}_ts_ms", stamp)
+            # Delayed exchange messages must not refresh stale prices on arrival.
+            age = max(0.0, self.ctx.now() - stamp / 1000.0)
+            setattr(m, f"{name}_mono", self.ctx.mono() - age)
         if index is not None:
             m.index = float(index)
         if funding_rate is not None:

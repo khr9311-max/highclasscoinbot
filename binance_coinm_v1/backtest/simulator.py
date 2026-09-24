@@ -46,6 +46,7 @@ class SimConfig:
     fractions: Tuple[float, float, float] = (0.25, 0.25, 0.25)
     start_equity_btc: float = 1.0
     risk_fraction: float = 0.005
+    max_daily_loss_pct: float = 2.0
     leverage: int = 3
     taker_fee: float = 0.0005
     slippage_bps: float = 3.0
@@ -226,9 +227,16 @@ class Simulator:
         tp_series = M if cfg.tp_trigger == "MARK_PRICE" else L
         dirs = set(cfg.directions)
         first = int(np.argmax(pre.valid)) if pre.valid.any() else n
+        day = None
+        day_equity = equity
         for i in range(first, n):
             t = float(L.t[i])
             o, h, l, c = float(L.o[i]), float(L.h[i]), float(L.l[i]), float(L.c[i])
+            if day != int(t // 86400):
+                day = int(t // 86400)
+                unreal = (im.pnl_btc(tr.direction, tr.qty, self.cs, tr.fill_px, float(M.o[i]))
+                          if tr is not None and tr.status == "open" else 0.0)
+                day_equity = equity + unreal
             exited_at_close = False     # 봉 마감 청산/취소 -> 이번 봉 신호로 새 진입 금지
             # ---- (a) 펀딩: 봉 시작 시각에 보유 중이면 ----
             if tr is not None and tr.status == "open" and tr.fill_bar < i:
@@ -244,6 +252,10 @@ class Simulator:
                 d = tr.direction
                 if t >= tr.expire_ts:
                     tr.status, tr.exit_reason = "cancelled", "expired"
+                    tr = None
+                elif day_equity > 0 and equity <= day_equity * (1 - cfg.max_daily_loss_pct / 100):
+                    tr.status, tr.skip_reason = "skipped", "daily_loss_limit"
+                    skipped.append(tr.to_dict())
                     tr = None
                 elif (d > 0 and h >= tr.trigger) or (d < 0 and l <= tr.trigger):
                     raw = max(tr.trigger, o) if d > 0 else min(tr.trigger, o)
@@ -361,6 +373,7 @@ class Simulator:
         if tr is not None and tr.status == "open":
             px = float(L.c[n - 1])
             equity += self._close_part(tr, tr.qty, px, float(L.t[n - 1]) + L.period, "end_of_data", cfg)
+            curve[n - 1] = equity
         mask = ~np.isnan(curve)
         return SimResult(cfg, [x.to_dict() for x in trades if x.status in ("closed",)],
                          skipped, curve[mask], L.t[mask], equity, funding_total)

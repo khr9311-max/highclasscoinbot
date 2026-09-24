@@ -41,9 +41,10 @@ class ExitManager:
             logger.warning("포지션 조회 실패: %s", e)
             return None
 
-    async def cancel_trade_orders(self, t: TradeRecord, roles: tuple) -> None:
+    async def cancel_trade_orders(self, t: TradeRecord, roles: tuple) -> bool:
         """이 거래의 해당 역할 주문 중 살아 있는 것을 전부 취소한다 (DB + 거래소 조회)."""
         ctx = self.ctx
+        complete = True
         targets: List[tuple] = []
         for row in ctx.db.list_orders(ctx.mode, trade_id=t.trade_id):
             p = ids.parse(row["client_order_id"])
@@ -55,20 +56,29 @@ class ExitManager:
                 targets.append((row["client_order_id"], bool(row["is_algo"])))
         # 거래소에만 있는 이 거래의 주문도 (DB 기록 누락 대비)
         try:
-            for a in await ctx.gw.get_open_algo_orders(ctx.symbol):
+            orders = (await ctx.gw.get_open_algo_orders(ctx.symbol) +
+                      await ctx.gw.get_open_orders(ctx.symbol))
+            for a in orders:
                 if ids.trade_of(a.client_id) == t.trade_id:
-                    role = "stop" if a.order_type == "STOP_MARKET" else "tp"
-                    if role in roles and (a.client_id, True) not in targets:
-                        targets.append((a.client_id, True))
+                    role = {"SL": "stop", "TP": "tp", "EN": "entry",
+                            "EX": "exit", "EM": "exit"}[ids.parse(a.client_id)[1]]
+                    if role in roles and (a.client_id, a.is_algo) not in targets:
+                        targets.append((a.client_id, a.is_algo))
         except ExchangeError as e:
             logger.warning("미체결 조건부 주문 조회 실패: %s", e)
+            complete = False
         for cid, is_algo in targets:
             try:
-                await ctx.cancel(cid, is_algo)
+                st = await ctx.cancel(cid, is_algo)
+                if not st.is_terminal:
+                    complete = False
             except LiveOrderBlocked as e:
                 logger.error("취소가 LiveOrderGate 에 막힘 %s: %s", cid, e)
+                complete = False
             except Exception as e:
                 logger.warning("취소 실패 %s: %s", cid, e)
+                complete = False
+        return complete
 
     async def close(self, t: TradeRecord, reason: str, emergency: bool = False) -> bool:
         ctx = self.ctx
@@ -113,8 +123,7 @@ class ExitManager:
             ctx.notify("critical", f"청산 실패 [{t.trade_id}] {reason} - 보호 손절은 유지, 수동 확인 필요",
                        critical=True)
             return False
-        await self.finalize(t)
-        return True
+        return await self.finalize(t)
 
     async def on_flat(self, t: TradeRecord, reason: str) -> None:
         """손절/목표/외부 청산으로 포지션이 0 이 됐다."""
@@ -126,9 +135,14 @@ class ExitManager:
         t.close_reason = t.close_reason or reason
         await self.finalize(t)
 
-    async def finalize(self, t: TradeRecord) -> None:
+    async def finalize(self, t: TradeRecord) -> bool:
         ctx = self.ctx
-        await self.cancel_trade_orders(t, ("stop", "tp"))
+        cleaned = await self.cancel_trade_orders(t, ("stop", "tp", "entry", "exit"))
+        t.qty_open = "0"
+        if not cleaned:
+            ctx.save(t)
+            ctx.db.log_risk_event(ctx.mode, "close_cleanup_pending", {"trade_id": t.trade_id})
+            return False
         await ctx.sync_fills(t)
         await ctx.sync_funding(t, int((t.opened_at or t.created_ts) * 1000))
         t.qty_open = "0"
@@ -140,6 +154,7 @@ class ExitManager:
                             f"순손익 {acc['net_pnl_btc']:+.8f} BTC (실현 {acc['realized_pnl_btc']:+.8f}, "
                             f"수수료 {acc['trading_fee_btc']:.8f}, 펀딩 {acc['funding_fee_btc']:+.8f})\n"
                             f"= {acc['net_pnl_usd']:+.2f} USD / {acc['net_pnl_krw']:+,.0f} KRW")
+        return True
 
     async def partial_now(self, t: TradeRecord, level: int, qty: Decimal, reason: str) -> None:
         """목표가 이미 지나 TP 주문을 걸 수 없을 때 즉시 부분청산 (reduceOnly)."""
