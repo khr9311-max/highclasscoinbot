@@ -1,0 +1,3 @@
+# Runtime-only subset of the repository's pinned dependencies. Python 3.12.
+aiohttp==3.14.3
+python-dotenv==1.2.2

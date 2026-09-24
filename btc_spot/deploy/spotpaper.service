@@ -1,0 +1,30 @@
+[Unit]
+Description=BTCUSDT spot forward paper observer
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=btcspot
+Group=btcspot
+WorkingDirectory=/opt/btc-spot
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/btc-spot/.venv/bin/python -m btc_spot run --mode paper --initial-btc 0.003 --state-dir /var/lib/btc-spot/paper
+KillSignal=SIGINT
+TimeoutStopSec=120
+Restart=on-failure
+RestartSec=30
+StateDirectory=btc-spot
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/btc-spot
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

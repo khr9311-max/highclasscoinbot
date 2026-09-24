@@ -1,0 +1,32 @@
+# Optional live template. Never installed, enabled or started automatically.
+[Unit]
+Description=BTCUSDT spot live execution
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=btcspot
+Group=btcspot
+WorkingDirectory=/opt/btc-spot
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/btc-spot/.venv/bin/python -m btc_spot run --mode live --initial-btc 0.003 --state-dir /var/lib/btc-spot/live --credentials-file /etc/btc-spot/binance.env --confirm I_UNDERSTAND_LIVE_SPOT
+KillSignal=SIGINT
+TimeoutStopSec=120
+Restart=on-failure
+RestartSec=30
+StateDirectory=btc-spot
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# The second path holds the same-host live-account lock, not credentials.
+ReadWritePaths=/var/lib/btc-spot /opt/btc-spot/btc_spot/state
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

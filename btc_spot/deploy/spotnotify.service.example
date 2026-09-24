@@ -1,0 +1,29 @@
+# Optional read-only Telegram companion. Install only during live cutover.
+[Unit]
+Description=BTC Spot Telegram status and fills
+Wants=network-online.target
+After=network-online.target spotlive.service
+
+[Service]
+Type=simple
+User=btcspot
+Group=btcspot
+WorkingDirectory=/opt/btc-spot
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/btc-spot/.venv/bin/python -m btc_spot.notify --state-dir /var/lib/btc-spot/live --credentials-file /etc/btc-spot/binance.env
+KillSignal=SIGINT
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/btc-spot/live
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target
