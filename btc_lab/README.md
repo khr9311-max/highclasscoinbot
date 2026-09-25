@@ -16,6 +16,9 @@
 COIN-M 유지 구간 개선은 시작 자본에 민감했다. 이후 현물 실행기를 별도로 구현했으며,
 아래 `btc_lab.pc` 명령은 과거 COIN-M 관측용으로 보존한다.
 
+[장중·스윙 전략 사전등록 탐색](STRATEGY_SEARCH_2026-09-25.md)에서 5분·15분·1시간 후보 72개는 검증 구간 플러스가 0개였고,
+현재 장중 대응 모드는 두 구간 모두 크게 손실이었다. 비용을 넘은 후보는 4시간봉·일봉 추세와 일간 알트 순환뿐이었다.
+
 [BTC 포트폴리오 실행기 과거 재생](PORTFOLIO_BACKTEST_2026-09-25.md)은 `btc_portfolio`의 알트 순환·COIN-M 규칙을
 2020-10 이후 시간봉으로 재생했다. BTC 기준 +43.38%(비용2배+19.65%), 최대낙폭10.55%였으나 이익이 소수 거래에 집중됐다.
 
@@ -40,6 +43,7 @@ COIN-M 유지 구간 개선은 시작 자본에 민감했다. 이후 현물 실�
 | `small_spot_sensitivity.py` | 고정 현물 분할 모멘텀의 ±10% 자본 민감도 |
 | `small_capital_report.py` | 예비 BTC를 포함한 전체계좌 수익·낙폭 재계산 |
 | `portfolio_backtest.py` | `btc_portfolio` 알트 순환·COIN-M 규칙의 시간봉 과거 재생과 강건성 점검 |
+| `intraday_data.py`, `strategy_search.py` | 5분봉 공개 자료와 장중·스윙 후보 132개의 사전등록 탐색 |
 | `forward.py`, `pc.py` | 완료 시간봉 기반 종이관측, 상태 저장·중복 실행 방지·PC 시작/정상 종료 |
 | `information.py` | 공식 RSS와 선택적 Gemini 정보 요약. 매매 판단에 연결하지 않음 |
 | `deploy/` | AWS CloudFormation·systemd·설치기·PC 원장 인계 절차 |
