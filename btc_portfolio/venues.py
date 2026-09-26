@@ -74,6 +74,8 @@ class Venues:
     def guard(self, method, path, params):
         if not self.allow_orders or self.stop_requested():
             raise ValueError("Portfolio order submission disabled")
+        if not self.config.coinm_managed:
+            raise ValueError("COIN-M is managed by the user")
         if (method, path) not in {("POST", "/dapi/v1/order"), ("POST", "/dapi/v1/algoOrder"),
                                   ("DELETE", "/dapi/v1/algoOrder")}:
             raise ValueError("Portfolio mutation endpoint rejected")
@@ -110,6 +112,11 @@ class Venues:
 
     async def account(self):
         first = next(iter(self.spots.values()))
+        if not self.config.coinm_managed:
+            # The COIN-M account is the user's: no private COIN-M request at all.
+            spot, permissions, orders, bnb_burn = await asyncio.gather(
+                first.account(), first.permissions(), first.open_orders(all_symbols=True), first.bnb_burn_status())
+            return {"spot": spot, "permissions": permissions, "spot_bnb_burn": bnb_burn, "spot_orders": orders}
         spot, permissions, orders, coin, mode, positions, algos = await asyncio.gather(
             first.account(), first.permissions(), first.open_orders(all_symbols=True), self.coin.get_account(),
             self.coin.get_position_mode(), self.coin.get_positions("BTCUSD_PERP"),
@@ -128,6 +135,10 @@ class Venues:
         if self._fee_cache and time.monotonic()-self._fee_cache[0] < 60:
             return self._fee_cache[1]
         spot = dict(zip(self.spots, await asyncio.gather(*(g.commission_rate() for g in self.spots.values()))))
+        if not self.config.coinm_managed:
+            result = {"spot": spot, "coinm": None}
+            self._fee_cache = (time.monotonic(), result)
+            return result
         _, taker = await self.coin.get_commission_rate("BTCUSD_PERP")
         coin = number(taker)
         if not 0 <= coin < Decimal(".01"):

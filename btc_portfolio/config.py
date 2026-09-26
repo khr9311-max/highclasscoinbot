@@ -35,6 +35,7 @@ class Config:
     kill_fraction: str = "0.25"
     timing_prediction_path: str = ""
     timing_max_wait_seconds: int = 14400
+    coinm_managed: bool = True        # False: the COIN-M account is the user's; the bot never reads or trades it
 
     def __post_init__(self):
         if self.strategy_mode not in {"swing", "intraday", "aggressive"}:
@@ -52,6 +53,12 @@ class Config:
         if self.timing_prediction_path and (self.strategy_mode != "aggressive"
                                             or not Path(self.timing_prediction_path).is_absolute()):
             raise ValueError("Execution timing needs aggressive mode and an absolute prediction path")
+        if type(self.coinm_managed) is not bool:
+            raise ValueError("coinm_managed must be true or false")
+        if not self.coinm_managed and (self.strategy_mode != "aggressive" or number(self.spot_fraction) != 1
+                                       or self.timing_prediction_path or self.rebalance_mode != "alert"):
+            raise ValueError("A manually managed COIN-M account needs aggressive mode, spot_fraction 1, "
+                             "no execution timing and alert-only rebalancing")
         if type(self.timing_max_wait_seconds) is not int or not 0 <= self.timing_max_wait_seconds <= 14400:
             raise ValueError("Execution timing wait must be 0..14400 seconds")
         if (type(self.intraday_cooldown_seconds) is not int or not 300 <= self.intraday_cooldown_seconds <= 3600

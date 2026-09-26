@@ -68,9 +68,28 @@ def rebalance_amount(spot_equity, coin_equity, spot_fraction):
     return difference  # positive: MAIN_CMFUTURE; negative: CMFUTURE_MAIN
 
 
+def spot_value(markets, account, wallet=None):
+    if wallet:
+        spot_equity = number(wallet["BTC"])
+        for symbol, market in markets["spot"].items():
+            spot_equity += number(wallet[symbol[:-3]])*number(market["bid"])
+        return spot_equity
+    balances = {row["asset"]: number(row["free"])+number(row["locked"]) for row in account["spot"]["balances"]}
+    # Without an owned ledger, this is a whole-account estimate and cannot be used for transfer.
+    spot_equity = balances.get("BTC", D(0))
+    for symbol, market in markets["spot"].items():
+        spot_equity += balances.get(symbol[:-3], D(0))*number(market["bid"])
+    return spot_equity
+
+
 def preview(config, markets, account, wallet=None):
     from .signals import alt_signal, coinm_signal
-    alt, coin = alt_signal(markets["spot"]), coinm_signal(markets["coinm"])
+    alt = alt_signal(markets["spot"])
+    if not config.coinm_managed:
+        return {"alt_signal": alt, "coinm_signal": None, "coinm": "manual",
+                "spot_equity_btc": str(spot_value(markets, account, wallet)),
+                "allocation_source": "owned_ledger" if wallet else "whole_spot_account_estimate"}
+    coin = coinm_signal(markets["coinm"])
     sigma = volatility(markets["coinm"])
     leverage = target_leverage(config, sigma)
     mark = number(markets["coinm"]["mark"])
@@ -82,16 +101,7 @@ def preview(config, markets, account, wallet=None):
     coin_equity = number(asset.margin_balance)
     qty = contract_count(leverage, coin_equity, entry, markets["coinm"]["spec"].contract_size)
     actual = account["position"]
-    spot_equity = number(wallet["BTC"]) if wallet else D(0)
-    if wallet:
-        for symbol, market in markets["spot"].items():
-            spot_equity += number(wallet[symbol[:-3]])*number(market["bid"])
-    else:
-        balances = {row["asset"]: number(row["free"])+number(row["locked"]) for row in account["spot"]["balances"]}
-        # Without an owned ledger, this is a whole-account estimate and cannot be used for transfer.
-        spot_equity = balances.get("BTC", D(0))
-        for symbol, market in markets["spot"].items():
-            spot_equity += balances.get(symbol[:-3], D(0))*number(market["bid"])
+    spot_equity = spot_value(markets, account, wallet)
     move = rebalance_amount(spot_equity, coin_equity, config.spot_fraction) if wallet else None
     post_coin = coin_equity+move if move is not None else None
     post_contracts = (contract_count(leverage, post_coin, entry, markets["coinm"]["spec"].contract_size)
@@ -197,20 +207,23 @@ async def execute(engine, account, markets, fees, equity):
     from .filters import plan_order
 
     s, c = engine.s, engine.c
-    alt, coin = alt_signal(markets["spot"]), coinm_signal(markets["coinm"])
+    alt = alt_signal(markets["spot"])
+    coin = coinm_signal(markets["coinm"]) if c.coinm_managed else None
     market = markets["coinm"]
     now = int(market["server_time_ms"])
     day = now//DAY
     from datetime import datetime, timezone
     date = datetime.fromtimestamp(now/1000, timezone.utc)
     month_key = f"{date.year:04d}-{date.month:02d}"
-    coin_equity = number(account["coin"].asset("BTC").margin_balance)
+    coin_equity = engine.coinm_equity(account)
     spot_equity = equity-coin_equity
     allocation = allocation_snapshot(c, spot_equity, coin_equity)
-    baseline = s.get("aggressive_initial_equity")
+    # Spot-only starts its own kill baseline: the COIN-M BTC left with the user is not ours to lose.
+    baseline_key = "aggressive_initial_equity" if c.coinm_managed else "spot_only_initial_equity"
+    baseline = s.get(baseline_key)
     if baseline is None:
         baseline = str(equity)
-        s.put("aggressive_initial_equity", baseline)
+        s.put(baseline_key, baseline)
     killed = equity <= number(baseline)*number(c.kill_fraction) or s.get("aggressive_killed", False)
     if killed and not s.get("aggressive_killed", False):
         s.put("aggressive_killed", True)
@@ -218,7 +231,7 @@ async def execute(engine, account, markets, fees, equity):
     result = {"status": "READY", "equity_btc": str(equity), "btc_usd_reference": market["mark"],
               "alt_signal": alt, "coinm_signal": coin, "allocation": allocation,
               "aggressive_killed": killed, "new_entries_allowed": not killed}
-    if not await validate_actual_position(engine, account, market):
+    if c.coinm_managed and not await validate_actual_position(engine, account, market):
         return {**result, "status": "BLOCKED", "action": "reduce_only_emergency_close"}
     wallet = s.get("wallet")
     if s.get("aggressive_transfer", {}).get("phase") == "PENDING":
@@ -251,91 +264,92 @@ async def execute(engine, account, markets, fees, equity):
             return {**result, "action": outcome}
         s.put("aggressive_alt_bar", alt["bar"])
 
-    position = account["position"]
-    signed = 1 if position.position_amt > 0 else -1 if position.position_amt < 0 else 0
     coin_wait = None
-    if signed and ((coin["direction"] and signed != coin["direction"]) or number(c.spot_fraction) == 1):
-        flip = bool(coin["direction"]) and number(c.spot_fraction) < 1
-        go, timing_info = timing.decide(s, c, coin, -signed, now) if flip else (True, None)
-        if go:
-            await reduce(engine, market, signed, abs(position.position_amt),
-                         "aggressive_flip:"+coin["bar"]+":"+str(abs(position.position_amt)))
-            s.event("aggressive_coin_flip", {"from": signed, "to": coin["direction"], "bar": coin["bar"],
-                                             **({"timing": timing_info} if timing_info else {})})
-            return {**result, "action": "coinm_reduce_only_flip"}
-        coin_wait = timing_info
-    elif coin["direction"] and signed == coin["direction"]:
-        timing.clear(s)
-
-    # Calendar-month rebalancing precedes the daily contract resize.
-    if date.day == 1 and s.get("aggressive_rebalanced_month") != month_key and not killed:
-        move = rebalance_amount(spot_equity, coin_equity, c.spot_fraction)
-        if move:
-            if c.rebalance_mode == "alert":
-                s.event("aggressive_rebalance_alert", {"month": month_key,
-                    "direction": "MAIN_CMFUTURE" if move > 0 else "CMFUTURE_MAIN", "amount_btc": str(abs(move))})
-            else:
-                from .transfer import rebalance_live
-                outcome = await rebalance_live(engine, account, markets, fees, move, month_key)
-                if outcome.get("status") != "ACKNOWLEDGED":
-                    return {**result, "action": outcome}
-                s.event("aggressive_rebalance", outcome)
-                s.put("aggressive_rebalanced_month", month_key)
-                return {**result, "action": outcome}
-        s.put("aggressive_rebalanced_month", month_key)
-
-    if (coin_wait is None and number(c.spot_fraction) < 1 and coin["direction"] and not signed and not killed
-            and s.get("aggressive_blocked_side") != coin["direction"]):
-        go, timing_info = timing.decide(s, c, coin, coin["direction"], now)
-        if not go:
+    if c.coinm_managed:
+        position = account["position"]
+        signed = 1 if position.position_amt > 0 else -1 if position.position_amt < 0 else 0
+        if signed and ((coin["direction"] and signed != coin["direction"]) or number(c.spot_fraction) == 1):
+            flip = bool(coin["direction"]) and number(c.spot_fraction) < 1
+            go, timing_info = timing.decide(s, c, coin, -signed, now) if flip else (True, None)
+            if go:
+                await reduce(engine, market, signed, abs(position.position_amt),
+                             "aggressive_flip:"+coin["bar"]+":"+str(abs(position.position_amt)))
+                s.event("aggressive_coin_flip", {"from": signed, "to": coin["direction"], "bar": coin["bar"],
+                                                 **({"timing": timing_info} if timing_info else {})})
+                return {**result, "action": "coinm_reduce_only_flip"}
             coin_wait = timing_info
-    if coin_wait is None and number(c.spot_fraction) < 1 and coin["direction"]:
-        if not signed and not killed and s.get("aggressive_blocked_side") != coin["direction"]:
-            if s.get("aggressive_blocked_side") is not None:
-                s.put("aggressive_blocked_side", None)
-            plan = coin_order_plan(c, market, coin["direction"], coin_equity,
-                                   account["coin"].asset("BTC").available_balance, fees["coinm"])
-            if plan["status"] == "READY":
-                await engine.submit("coinm", "aggressive_entry:"+coin["bar"], {**plan, "_market": market})
-                updated = await engine.v.account()
-                if s.pending():
+        elif coin["direction"] and signed == coin["direction"]:
+            timing.clear(s)
+
+        # Calendar-month rebalancing precedes the daily contract resize.
+        if date.day == 1 and s.get("aggressive_rebalanced_month") != month_key and not killed:
+            move = rebalance_amount(spot_equity, coin_equity, c.spot_fraction)
+            if move:
+                if c.rebalance_mode == "alert":
+                    s.event("aggressive_rebalance_alert", {"month": month_key,
+                        "direction": "MAIN_CMFUTURE" if move > 0 else "CMFUTURE_MAIN", "amount_btc": str(abs(move))})
+                else:
+                    from .transfer import rebalance_live
+                    outcome = await rebalance_live(engine, account, markets, fees, move, month_key)
+                    if outcome.get("status") != "ACKNOWLEDGED":
+                        return {**result, "action": outcome}
+                    s.event("aggressive_rebalance", outcome)
+                    s.put("aggressive_rebalanced_month", month_key)
+                    return {**result, "action": outcome}
+            s.put("aggressive_rebalanced_month", month_key)
+
+        if (coin_wait is None and number(c.spot_fraction) < 1 and coin["direction"] and not signed and not killed
+                and s.get("aggressive_blocked_side") != coin["direction"]):
+            go, timing_info = timing.decide(s, c, coin, coin["direction"], now)
+            if not go:
+                coin_wait = timing_info
+        if coin_wait is None and number(c.spot_fraction) < 1 and coin["direction"]:
+            if not signed and not killed and s.get("aggressive_blocked_side") != coin["direction"]:
+                if s.get("aggressive_blocked_side") is not None:
+                    s.put("aggressive_blocked_side", None)
+                plan = coin_order_plan(c, market, coin["direction"], coin_equity,
+                                       account["coin"].asset("BTC").available_balance, fees["coinm"])
+                if plan["status"] == "READY":
+                    await engine.submit("coinm", "aggressive_entry:"+coin["bar"], {**plan, "_market": market})
+                    updated = await engine.v.account()
+                    if s.pending():
+                        await engine.protect(updated)
+                        return {**result, "status": "PENDING", "action": "coinm_entry_unresolved"}
+                    if not await validate_actual_position(engine, updated, market):
+                        return {**result, "status": "BLOCKED", "action": "reduce_only_emergency_close"}
                     await engine.protect(updated)
-                    return {**result, "status": "PENDING", "action": "coinm_entry_unresolved"}
-                if not await validate_actual_position(engine, updated, market):
-                    return {**result, "status": "BLOCKED", "action": "reduce_only_emergency_close"}
-                await engine.protect(updated)
-                s.event("aggressive_coin_entry", {"bar": coin["bar"], "plan": plan,
-                                                  "timing": (s.get("timing_wait") or {})})
-                return {**result, "action": "coinm_entry", "plan": plan}
-            result["coinm_skip"] = plan
-        elif signed and c.leverage_mode == "vol" and now//DAY != s.get("aggressive_resized_day"):
-            s.put("aggressive_resized_day", now//DAY)
-            sigma = volatility(market)
-            lev = target_leverage(c, sigma)
-            current = int(abs(position.position_amt))
-            target = contract_count(lev, coin_equity, market["mark"], market["spec"].contract_size)
-            target = min(target, contract_count(D(3), coin_equity, market["mark"], market["spec"].contract_size))
-            if abs(target-current) >= max(1, round(.25*current)):
-                if target < current and target >= 1:
-                    await reduce(engine, market, signed, current-target,
-                                 "aggressive_resize_down:"+str(day))
-                    s.event("aggressive_coin_resize", {"from": current, "to": target, "day": day})
-                    return {**result, "action": "coinm_resize_down"}
-                if target > current and not killed:
-                    plan = coin_order_plan(c, market, signed, coin_equity,
-                        account["coin"].asset("BTC").available_balance, fees["coinm"], current=current,
-                        stop=s.get("position_stop"), entry=position.entry_price)
-                    if plan["status"] == "READY":
-                        await engine.submit("coinm", "aggressive_resize_up:"+str(day),
-                                            {**plan, "aggressive_resize": True, "_market": market})
-                        updated = await engine.v.account()
-                        if s.pending():
-                            await engine.protect(updated)
-                            return {**result, "status": "PENDING", "action": "coinm_resize_unresolved"}
-                        if not await validate_actual_position(engine, updated, market):
-                            return {**result, "status": "BLOCKED", "action": "reduce_only_emergency_close"}
-                        s.event("aggressive_coin_resize", {"from": current, "to": plan["target_contracts"], "day": day})
-                        return {**result, "action": "coinm_resize_up", "plan": plan}
+                    s.event("aggressive_coin_entry", {"bar": coin["bar"], "plan": plan,
+                                                      "timing": (s.get("timing_wait") or {})})
+                    return {**result, "action": "coinm_entry", "plan": plan}
+                result["coinm_skip"] = plan
+            elif signed and c.leverage_mode == "vol" and now//DAY != s.get("aggressive_resized_day"):
+                s.put("aggressive_resized_day", now//DAY)
+                sigma = volatility(market)
+                lev = target_leverage(c, sigma)
+                current = int(abs(position.position_amt))
+                target = contract_count(lev, coin_equity, market["mark"], market["spec"].contract_size)
+                target = min(target, contract_count(D(3), coin_equity, market["mark"], market["spec"].contract_size))
+                if abs(target-current) >= max(1, round(.25*current)):
+                    if target < current and target >= 1:
+                        await reduce(engine, market, signed, current-target,
+                                     "aggressive_resize_down:"+str(day))
+                        s.event("aggressive_coin_resize", {"from": current, "to": target, "day": day})
+                        return {**result, "action": "coinm_resize_down"}
+                    if target > current and not killed:
+                        plan = coin_order_plan(c, market, signed, coin_equity,
+                            account["coin"].asset("BTC").available_balance, fees["coinm"], current=current,
+                            stop=s.get("position_stop"), entry=position.entry_price)
+                        if plan["status"] == "READY":
+                            await engine.submit("coinm", "aggressive_resize_up:"+str(day),
+                                                {**plan, "aggressive_resize": True, "_market": market})
+                            updated = await engine.v.account()
+                            if s.pending():
+                                await engine.protect(updated)
+                                return {**result, "status": "PENDING", "action": "coinm_resize_unresolved"}
+                            if not await validate_actual_position(engine, updated, market):
+                                return {**result, "status": "BLOCKED", "action": "reduce_only_emergency_close"}
+                            s.event("aggressive_coin_resize", {"from": current, "to": plan["target_contracts"], "day": day})
+                            return {**result, "action": "coinm_resize_up", "plan": plan}
 
     if coin_wait is not None:
         result["coinm_timing_wait"] = coin_wait

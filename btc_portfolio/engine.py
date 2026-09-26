@@ -75,6 +75,8 @@ class Engine:
         self.v, self.s, self.c = venues, store, config
 
     def readiness(self, account):
+        if not self.c.coinm_managed:
+            return self.spot_only_readiness(account)
         reasons = []
         balances = account_balances(account["spot"])
         position, coin = account["position"], account["coin"]
@@ -120,6 +122,26 @@ class Engine:
             if abs(number(btc.wallet_balance)-number(self.c.coinm_btc)) > D(".00000001"):
                 reasons.append("coinm_wallet_must_match_dedicated_budget")
         return reasons
+
+    def spot_only_readiness(self, account):
+        """COIN-M belongs to the user: only spot is checked, and the ledger must own nothing there."""
+        reasons = []
+        if account["spot"].get("canTrade") is not True:
+            reasons.append("account_trading_disabled")
+        if account["permissions"].get("enableSpotAndMarginTrading") is not True:
+            reasons.append("spot_permission_required")
+        if account.get("spot_bnb_burn") is not False:
+            reasons.append("disable_spot_bnb_fee_payment_before_aggressive_trading")
+        if account["spot_orders"]:
+            reasons.append("open_orders_present")
+        if not self.s or self.s.get("wallet") is None:
+            reasons.append("registered_ledger_required_for_spot_only")
+        elif number(self.s.get("coin_qty", "0")) or self.s.get("stop") or self.s.get("position_stop"):
+            reasons.append("ledger_still_owns_coinm_position")
+        return reasons
+
+    def coinm_intent_pending(self):
+        return any(p["venue"] == "coinm" for p in self.s.pending())
 
     async def initialize(self, account):
         if self.s.get("wallet") is not None:
@@ -360,21 +382,27 @@ class Engine:
         self.s.put("halt", "protection_not_confirmed")
         raise ValueError("COIN-M protection not confirmed")
 
+    def coinm_equity(self, account):
+        return number(account["coin"].asset("BTC").margin_balance) if self.c.coinm_managed else D(0)
+
     def equity(self, account, markets):
         wallet = self.s.get("wallet")
         spot = number(wallet["BTC"])
         for symbol, market in markets["spot"].items():
             spot += number(wallet[symbol[:-3]])*number(market["bid"])
-        return spot+number(account["coin"].asset("BTC").margin_balance)
+        return spot+self.coinm_equity(account)
 
     async def tick(self):
         account = await self.v.account()
         await self.initialize(account)
+        if not self.c.coinm_managed and self.coinm_intent_pending():
+            return {"status": "BLOCKED", "reason": "ledger_still_owns_coinm_order"}
         # Reconcile entries before testing account balances; fills may have changed them.
         for intent in self.s.pending():
             await self.reconcile(intent)
         account = await self.v.account()
-        await self.protect(account)
+        if self.c.coinm_managed:
+            await self.protect(account)
         if self.s.pending():
             return {"status": "PENDING", "reason": "query_only_unknown_or_incomplete_order"}
         self.check_spot(account)
@@ -385,7 +413,7 @@ class Engine:
             return {"status": "BLOCKED", "reason": self.s.get("halt")}
         markets, fees = await self.v.markets(), await self.v.fees()
         equity = self.equity(account, markets)
-        coinm_equity = number(account["coin"].asset("BTC").margin_balance)
+        coinm_equity = self.coinm_equity(account)
         allocation = allocation_snapshot(self.c, equity-coinm_equity, coinm_equity)
         day = int(markets["coinm"]["server_time_ms"])//86_400_000
         day_start = self.s.get("day_start")

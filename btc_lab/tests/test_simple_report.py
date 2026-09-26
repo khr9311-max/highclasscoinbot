@@ -7,11 +7,12 @@ from btc_lab import llm_judge as lj
 T = 1_790_424_000_000                     # an hour boundary
 
 
-def snap_at(t, close, equity=None, halt=None, waiting=False, qty=3, age=10):
+def snap_at(t, close, equity=None, halt=None, waiting=False, qty=3, age=10, manual=False):
     return {"bar_close_ms": t, "created_ms": t, "close": close, "mark": close, "daily_open": 84_000.0,
             "taker_bs": {"um": {"12": 1.05}}, "pred": {},
             "portfolio": None if equity is None else {"equity_btc": equity, "coin_qty": qty, "alt": "SOL",
-                                                      "halt": halt, "waiting": waiting, "age_s": age}}
+                                                      "halt": halt, "waiting": waiting, "age_s": age,
+                                                      "manual_coinm": manual}}
 
 
 def test_status_file_is_read_without_touching_it(tmp_path):
@@ -21,7 +22,8 @@ def test_status_file_is_read_without_touching_it(tmp_path):
                                 "result": {"equity_btc": "0.003", "alt_signal": {"symbol": "SOLBTC"},
                                            "coinm_timing_wait": {"timing": "waiting"}}}))
     p = lg.read_portfolio(path, T)
-    assert p == {"equity_btc": 0.003, "coin_qty": -2.0, "alt": None, "halt": None, "waiting": True, "age_s": 5.0}
+    assert p == {"equity_btc": 0.003, "coin_qty": -2.0, "manual_coinm": False, "alt": None, "halt": None,
+                 "waiting": True, "age_s": 5.0}
     assert lg.read_portfolio(tmp_path / "missing.json", T) is None
 
 
@@ -68,3 +70,19 @@ def test_stale_gemini_calls_are_not_shown(tmp_path):
     assert lj.simple_lines(db, T) == []
     db.close()
 
+
+def test_manual_futures_show_the_bot_spot_assets_only(tmp_path):
+    path = tmp_path / "status.json"
+    path.write_text(json.dumps({"updated_at_ms": T - 5000, "coinm_managed": False, "coin_qty": "0", "halt": None,
+                                "wallet": {"BTC": "0", "SOL": "1.05"},
+                                "result": {"equity_btc": "0.0015", "alt_signal": {"symbol": "SOLBTC"}}}))
+    assert lg.read_portfolio(path, T)["manual_coinm"] is True
+    db = lg.open_db(tmp_path)
+    lg.store(db, snap_at(T - 86_400_000, 83_000.0, 0.0030))               # before: spot + COIN-M together
+    text = lg.simple_report(db, snap_at(T, 84_000.0, 0.0015, qty=0, manual=True))
+    assert "💰 봇 자산(현물) 0.001500 BTC" in text and "하루" not in text   # not comparable with the old total
+    assert "🤖 봇: 알트 SOL 보유 · 선물은 직접 관리(봇은 안 건드림)" in text and "선물 포지션 없음" not in text
+    lg.store(db, snap_at(T - 3_600_000, 84_000.0, 0.0015, qty=0, manual=True))
+    text = lg.simple_report(db, snap_at(T + 86_400_000 - 3_600_000, 84_000.0, 0.00165, qty=0, manual=True))
+    assert "하루 +10.0%" in text
+    db.close()

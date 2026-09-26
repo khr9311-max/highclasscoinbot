@@ -512,6 +512,7 @@ def read_portfolio(path, now_ms):
         alt = (r.get("alt_signal") or {}).get("symbol")
         held = bool(alt) and float((s.get("wallet") or {}).get(alt[:-3], 0)) > 0
         return {"equity_btc": float(r["equity_btc"]), "coin_qty": float(s.get("coin_qty") or 0),
+                "manual_coinm": s.get("coinm_managed") is False,
                 "alt": alt[:-3] if held else None, "halt": s.get("halt"),
                 "waiting": bool(r.get("coinm_timing_wait")), "age_s": (now_ms - int(s["updated_at_ms"])) / 1000}
     except (OSError, ValueError, KeyError, TypeError):
@@ -543,11 +544,14 @@ def simple_report(db, snap, krw_rate=1390.0):
     lines = [f"[비트코인 봇] {t:%m/%d %H:%M}"]
     p, price = snap.get("portfolio"), snap["mark"]
     if p:
+        manual = p.get("manual_coinm", False)
         day = _earlier(db, snap, 86_400_000)
         change = ""
-        if day and day.get("portfolio"):
+        # A day-old figure from before futures went manual still included COIN-M: not comparable.
+        if day and day.get("portfolio") and day["portfolio"].get("manual_coinm", False) == manual:
             change = f" · 하루 {_pct(p['equity_btc'] / day['portfolio']['equity_btc'] - 1, 1)}"
-        lines.append(f"💰 내 자산 {p['equity_btc']:.6f} BTC (약 {p['equity_btc'] * price * krw_rate / 10000:.1f}만원){change}")
+        label = "봇 자산(현물)" if manual else "내 자산"
+        lines.append(f"💰 {label} {p['equity_btc']:.6f} BTC (약 {p['equity_btc'] * price * krw_rate / 10000:.1f}만원){change}")
     hour = _earlier(db, snap, 3_600_000)
     one_h = f" · 1시간 {_pct(snap['close'] / hour['close'] - 1, 1)}" if hour else ""
     lines.append(f"📊 비트코인 {price:,.0f}달러{one_h} · 오늘 {_pct(snap['close'] / snap['daily_open'] - 1, 1)}")
@@ -556,6 +560,9 @@ def simple_report(db, snap, krw_rate=1390.0):
             lines.append(f"⚠️ 봇 멈춤: {p['halt']}")
         elif p["age_s"] > 300:
             lines.append("⚠️ 봇 상태가 5분 넘게 갱신되지 않음")
+        elif manual:
+            alt = f"알트 {p['alt']} 보유" if p["alt"] else "알트 없음(BTC로 대기)"
+            lines.append("🤖 봇: " + alt + " · 선물은 직접 관리(봇은 안 건드림)")
         else:
             fut = ("상승에 베팅 중(선물 롱)" if p["coin_qty"] > 0 else "하락에 베팅 중(선물 숏)" if p["coin_qty"] < 0
                    else "선물 포지션 없음")

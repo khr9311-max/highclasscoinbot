@@ -38,6 +38,10 @@ def rebind_blockers(state, account, readiness, stopped):
         blockers.append("ledger_is_not_live")
     if state.get("halt"):
         blockers.append("existing_halt_requires_resolution")
+    if "position" not in account:          # COIN-M left to the user: the ledger must own nothing there
+        if number(state.get("coin_qty", "0")) or state.get("stop") or state.get("position_stop"):
+            blockers.append("ledger_still_owns_coinm_position")
+        return list(dict.fromkeys(blockers))
     amount = account["position"].position_amt
     if number(state.get("coin_qty", "0")) != amount:
         blockers.append("ledger_coinm_quantity_differs_from_exchange")
@@ -102,7 +106,7 @@ async def dispatch(args):
             old, new = state["binding"]["identity"], config.identity()
             return state, {"ready": False, "old_identity": old, "new_identity": new,
                            "blockers": rebind_blockers(state, account, readiness, service_stopped()),
-                           "coinm_contracts": str(account["position"].position_amt),
+                           "coinm_contracts": str(account["position"].position_amt) if "position" in account else "manual",
                            "protective_stop": (state.get("stop") or {}).get("id")}
         state, preview = await check()
         if preview["old_identity"] == preview["new_identity"]:

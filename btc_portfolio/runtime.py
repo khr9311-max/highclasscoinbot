@@ -76,8 +76,8 @@ async def prepare(venues, config, directory):
             result = {"mode": "prepare", "orders_submitted": 0, "transfers_submitted": 0,
                       "identity": config.identity(), "config": asdict(config), "ready": not blockers,
                       "blockers": list(dict.fromkeys(blockers)), **view,
-                      "coinm_margin_type": account["position"].margin_type,
-                      "coinm_leverage": account["position"].leverage,
+                      **({"coinm_margin_type": account["position"].margin_type,
+                          "coinm_leverage": account["position"].leverage} if config.coinm_managed else {}),
                       "spot_bnb_burn": account.get("spot_bnb_burn"),
                       "universal_transfer_permission": account["permissions"].get("permitsUniversalTransfer"),
                       "updated_at_ms": time.time_ns()//1_000_000}
@@ -181,7 +181,8 @@ async def run(venues, config, directory, *, once=False, poll_seconds=30):
                     result["retry_after_seconds"] = delay
                 store.event("runtime_error", result)
             state = {"mode": "live", "orders_enabled": True, "updated_at_ms": time.time_ns()//1_000_000,
-                     "strategy_mode": config.strategy_mode, "evaluation_interval_seconds": poll_seconds,
+                     "strategy_mode": config.strategy_mode, "coinm_managed": config.coinm_managed,
+                     "evaluation_interval_seconds": poll_seconds,
                      "result": result, "wallet": store.get("wallet"), "coin_qty": store.get("coin_qty"),
                      "stop": store.get("stop"), "halt": store.get("halt"), "pending": len(store.pending())}
             atomic_json(directory/"status.json", state)

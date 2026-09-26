@@ -81,8 +81,10 @@ async def dispatch(directory, config, delivery, fx, session):
             key = "portfolio:recovered:"+last_error[1]
             recovered = True
     if not delivery.sent(key):
+        manual = state.get("coinm_managed") is False
+        coin = "COIN-M 직접 관리(봇 미사용)" if manual else f"COIN-M 계약 {state.get('coin_qty')}"
         body = (f"[BTC 포트폴리오 상태] {status}\n최근 갱신 {age}초 전\n"
-                f"COIN-M 계약 {state.get('coin_qty')} · 미확정 주문 {state.get('pending')}\n"
+                f"{coin} · 미확정 주문 {state.get('pending')}\n"
                 f"현물 원장 {state.get('wallet')}\n차단 사유 {state.get('halt') or result.get('reason') or result.get('reasons') or '-'}")
         if recovered:
             body += "\n이전 오류에서 복구됨"
@@ -91,7 +93,7 @@ async def dispatch(directory, config, delivery, fx, session):
         if result.get("equity_btc"):
             body += f"\nBTC 환산 운용자산 {result['equity_btc']} BTC"
         allocation = result.get("allocation")
-        if allocation:
+        if allocation and not manual:
             from decimal import Decimal
             spot_pct = Decimal(allocation["spot_weight_pct"])
             coin_pct = Decimal(allocation["coinm_weight_pct"])
