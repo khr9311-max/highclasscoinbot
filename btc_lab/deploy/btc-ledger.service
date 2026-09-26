@@ -1,0 +1,38 @@
+[Unit]
+Description=BTCUSD_PERP situation ledger (public market data only, no orders)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=btcspot
+Group=btcspot
+WorkingDirectory=/opt/btc-spot
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+UnsetEnvironment=BINANCE_API_KEY BINANCE_API_SECRET AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+ExecStart=/opt/btc-ledger/.venv/bin/python -m btc_lab.ledger run --state-dir /var/lib/btc-ledger --model /var/lib/btc-ledger/model/ledger_model.json --credentials-file /etc/btc-spot/ledger-telegram.env
+Restart=on-failure
+RestartSec=30
+KillSignal=SIGINT
+TimeoutStopSec=30
+StateDirectory=btc-ledger
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/btc-ledger
+MemoryMax=600M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

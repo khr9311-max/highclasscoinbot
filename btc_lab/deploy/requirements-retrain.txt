@@ -1,0 +1,7 @@
+# Training-only packages for btc_lab.retrain in /opt/btc-ledger/.venv (Python 3.12).
+# LightGBM needs libgomp; install-retrain.sh unpacks it privately for the retrain service.
+lightgbm==4.7.0
+scipy==1.18.1
+narwhals==2.25.0
+# LGBMRegressor (the API the research used) needs scikit-learn.
+scikit-learn==1.9.0

@@ -1,0 +1,10 @@
+[Unit]
+Description=Monthly situation ledger retrain (3rd of each month, 03:30 UTC)
+
+[Timer]
+OnCalendar=*-*-03 03:30:00 UTC
+Persistent=true
+RandomizedDelaySec=900
+
+[Install]
+WantedBy=timers.target

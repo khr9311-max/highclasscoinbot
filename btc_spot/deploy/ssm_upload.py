@@ -43,11 +43,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("archive", type=Path)
     parser.add_argument("instance_id")
+    parser.add_argument("--destination", default="/tmp/btcspot-stage.zip")
     args = parser.parse_args()
     payload = args.archive.read_bytes()
     digest = hashlib.sha256(payload).hexdigest()
     encoded = base64.b64encode(payload).decode("ascii")
-    destination = "/tmp/btcspot-stage.zip"
+    destination = args.destination
+    if not destination.startswith("/tmp/") or not destination.endswith(".zip") or "'" in destination:
+        raise ValueError("Destination must be a .zip path under /tmp")
     scratch = destination + ".b64"
     ssm = boto3.client("ssm", region_name="ap-northeast-2")
     command(ssm, args.instance_id, f"umask 077; : > {scratch}")

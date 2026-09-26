@@ -1,0 +1,29 @@
+[Unit]
+Description=Monthly retrain of the situation ledger models (public data, gated promotion, no orders)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=btcspot
+Group=btcspot
+WorkingDirectory=/opt/btc-spot
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 LD_LIBRARY_PATH=/opt/btc-ledger/gomp/usr/lib/x86_64-linux-gnu
+UnsetEnvironment=BINANCE_API_KEY BINANCE_API_SECRET AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+ExecStart=/opt/btc-ledger/.venv/bin/python -m btc_lab.retrain run --data-dir /var/lib/btc-ledger/retrain --model /var/lib/btc-ledger/model/ledger_model.json --credentials-file /etc/btc-spot/ledger-telegram.env
+Nice=10
+IOSchedulingClass=idle
+MemoryMax=900M
+TimeoutStartSec=3600
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/btc-ledger
