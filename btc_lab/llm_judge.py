@@ -25,7 +25,9 @@ DIRECTIONS = ("long", "short", "flat")
 SYSTEM = (
     "You are a discretionary BTC futures trader. Decide the BTCUSD perpetual position for the next 1 hour and "
     "the next 4 hours from the JSON market snapshot you are given. Use only the numbers in the snapshot; never "
-    "assume or invent other data. Returns are percent changes of the BTC price. 'flat' means no position. "
+    "assume or invent other data. All values are relative: percent changes, ratios and percentages of price. "
+    "Taker ratio above 1 means more aggressive buying. 'situation' is a Korean label (trend, volatility, "
+    "taker flow, open interest). 'flat' means no position. "
     "Answer with a single JSON object and nothing else: "
     '{"direction_1h": "long"|"short"|"flat", "direction_4h": "long"|"short"|"flat", '
     '"confidence": number between 0 and 1, "reason": "one short sentence in Korean, at most 80 characters"}'
@@ -60,15 +62,37 @@ def recent_returns(close, bars):
     return [round(float(v), 3) for v in (pts[1:] / pts[:-1] - 1) * 100]
 
 
+def _r(v, digits=3):
+    return None if v is None else round(float(v), digits)
+
+
 def build_prompt(snap, close):
-    keep = ("close", "mark", "index", "premium", "daily_open", "vwap", "cm_oi_contracts", "um_oi_btc", "um_doi",
-            "taker_bs", "top_position_long", "top_position_ls", "top_position_ls_d1h", "global_ls",
-            "funding_last", "funding_next_est", "atr", "situation", "swing")
-    payload = {k: snap[k] for k in keep if k in snap}
-    payload["time_utc"] = time.strftime("%Y-%m-%d %H:%M", time.gmtime(snap["bar_close_ms"] / 1000))
-    payload["hourly_returns_pct_last_48h"] = recent_returns(np.asarray(close[-12 * 48 - 1:]), 12)
-    payload["four_hour_returns_pct_last_3d"] = recent_returns(np.asarray(close[-48 * 18 - 1:]), 48)
-    return json.dumps(payload, separators=(",", ":"), default=float)
+    """Relative numbers only (no dates, price or OI levels), so the same prompt can be scored on
+    data after the model's training without it recognising the period (llm_backtest)."""
+    c = snap["close"]
+    rel = lambda ref: None if not ref else _r((c / ref - 1) * 100)
+    bars = {"1": "5m", "3": "15m", "12": "1h", "48": "4h"}
+    swing = snap.get("swing") or {}
+    payload = {
+        "price_vs_utc_daily_open_pct": rel(snap.get("daily_open")),
+        "price_vs_daily_vwap_pct": rel(snap.get("vwap")),
+        "perp_premium_pct": _r((snap.get("premium") or 0) * 100, 4),
+        "open_interest_change_pct": {bars[k]: _r(v * 100) if v is not None else None
+                                     for k, v in (snap.get("um_doi") or {}).items() if k in bars},
+        "taker_buy_sell_ratio": {venue: {bars[k]: _r(v) for k, v in (snap.get("taker_bs") or {}).get(src, {}).items()}
+                                 for venue, src in (("usdt_margined", "um"), ("coin_margined", "cm"))},
+        "top_traders_long_share": _r(snap.get("top_position_long")),
+        "top_traders_long_short_ratio": _r(snap.get("top_position_ls")),
+        "top_traders_ratio_change_1h": _r(snap.get("top_position_ls_d1h"), 4),
+        "all_accounts_long_short_ratio": _r(snap.get("global_ls")),
+        "last_funding_rate_pct": _r((snap.get("funding_last") or 0) * 100, 4),
+        "atr_pct_of_price": {k: _r(v / c * 100) for k, v in (snap.get("atr") or {}).items() if v},
+        "situation": (snap.get("situation") or {}).get("text"),
+        "trend_4h_ema20_vs_ema80": {"direction": swing.get("direction"), "gap_pct": _r((swing.get("gap") or 0) * 100)},
+        "hourly_returns_pct_last_48h": recent_returns(np.asarray(close[-12 * 48 - 1:]), 12),
+        "four_hour_returns_pct_last_3d": recent_returns(np.asarray(close[-48 * 18 - 1:]), 48),
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 def parse(text):
@@ -133,8 +157,8 @@ def scores(db, since_ms):
 
 def simple_lines(db, snap_ms, min_calls=20):
     """Gemini's latest 4h call and its 7-day hit rate next to 'always up', in plain words."""
-    row = db.execute("SELECT direction_4h, error FROM llm_decisions ORDER BY bar_close_ms DESC LIMIT 1").fetchone()
-    if not row:
+    row = db.execute("SELECT direction_4h, error, bar_close_ms FROM llm_decisions ORDER BY bar_close_ms DESC LIMIT 1").fetchone()
+    if not row or snap_ms - row[2] > 3_600_000:           # judge switched off or silent: show nothing stale
         return []
     if row[1]:
         return ["🧪 AI 연습 판단: 이번에는 응답 실패 (매매엔 영향 없음)"]

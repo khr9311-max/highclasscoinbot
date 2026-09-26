@@ -66,6 +66,8 @@ Gemini 리포트식 점수는 비용 전에도 예측력이 없었다. 매월 �
 | `timing_overlay.py` | 재학습 모델로 swing 매수·매도 시점을 최대 4시간 안에서 고르는 규칙의 사전등록 검증 |
 | `ledger.py`, `deploy/*ledger*` | 거래소 실측 상황 원장: 5분 스냅샷·모델 예측·자동 채점·매시 텔레그램, 서버 설치 묶음 |
 | `retrain.py`, `deploy/*retrain*` | 원장 모델의 월간 자동 재학습: 아카이브 갱신·점검 모델·고정 관문·원자적 교체·텔레그램 보고 |
+| `llm_judge.py`, `llm_backtest.py` | Gemini 섀도 판단(현재 꺼짐)과 학습 이후 기간의 사전등록 과거 검증: 세 모델 모두 '항상 롱'보다 낮음 |
+| `leverage_study.py`, `trend_portfolio.py` | 레버리지별 BTC 결과(약 1배가 최대)와 6개 코인 추세 분산 검증 |
 | `extra_data.py`, `model_search.py` | 호가창 깊이·다른 코인 5분 자료와 2시간 예측 모델 개선의 사전등록 탐색 |
 | `external_data.py`, `predict_search.py` | 코인베이스·업비트·데리빗 자료와 예측 기간·학습 방식 탐색, 봉인 구간 검증 |
 | `trend_portfolio.py` | 실거래 4시간 EMA 규칙을 6개 코인에 적용한 분산 포트폴리오의 사전등록 검증 |

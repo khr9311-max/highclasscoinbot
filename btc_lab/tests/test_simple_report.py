@@ -60,3 +60,11 @@ def test_gemini_lines_wait_for_enough_calls(tmp_path):
 def test_mood_words():
     assert lg.mood(1.2) == "사려는 쪽이 강함" and lg.mood(1.0) == "팽팽함" and lg.mood(0.8) == "팔려는 쪽이 강함"
     assert lg.mood(None) == "알 수 없음"
+
+
+def test_stale_gemini_calls_are_not_shown(tmp_path):
+    db = lg.open_db(tmp_path)
+    lj.store(db, T - 2 * 3_600_000, "m", {"direction_1h": "long", "direction_4h": "long", "confidence": 0.5, "reason": ""})
+    assert lj.simple_lines(db, T) == []
+    db.close()
+

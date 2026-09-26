@@ -25,12 +25,19 @@ def test_recent_returns_step_back_from_the_last_close():
     assert r == [pytest.approx(12.0), pytest.approx(round(12 / 112 * 100, 3))]
 
 
-def test_prompt_carries_snapshot_numbers_only():
-    snap = {"bar_close_ms": 1_790_406_000_000, "close": 84000.0, "mark": 84001.0, "pred": {"24": 0.001},
-            "model_inputs": {"x": 1}, "swing": {"direction": 1, "gap": 0.02}}
-    prompt = json.loads(lj.build_prompt(snap, np.linspace(80000, 84000, 1000)))
-    assert prompt["close"] == 84000.0 and prompt["swing"]["direction"] == 1
-    assert "pred" not in prompt and "model_inputs" not in prompt
+def test_prompt_is_relative_without_dates_or_levels():
+    snap = {"bar_close_ms": 1_790_406_000_000, "close": 84000.0, "mark": 84001.0, "daily_open": 80000.0,
+            "vwap": 84000.0, "pred": {"24": 0.001}, "model_inputs": {"x": 1}, "cm_oi_contracts": 12_600_000,
+            "um_doi": {"1": 0.001, "12": -0.002}, "taker_bs": {"um": {"1": 1.2, "12": 0.9}, "cm": {"12": 1.0}},
+            "atr": {"1h": 420.0}, "swing": {"direction": 1, "gap": 0.02}, "situation": {"text": "상승"}}
+    text = lj.build_prompt(snap, np.linspace(80000, 84000, 1000))
+    prompt = json.loads(text)
+    assert prompt["price_vs_utc_daily_open_pct"] == 5.0 and prompt["price_vs_daily_vwap_pct"] == 0.0
+    assert prompt["open_interest_change_pct"] == {"5m": 0.1, "1h": -0.2}
+    assert prompt["taker_buy_sell_ratio"]["usdt_margined"] == {"5m": 1.2, "1h": 0.9}
+    assert prompt["atr_pct_of_price"] == {"1h": 0.5} and prompt["trend_4h_ema20_vs_ema80"] == {"direction": 1, "gap_pct": 2.0}
+    for leak in ("84000", "80000", "12600000", "2026", "pred", "model_inputs"):
+        assert leak not in text
     assert len(prompt["hourly_returns_pct_last_48h"]) == 48 and len(prompt["four_hour_returns_pct_last_3d"]) == 18
 
 
