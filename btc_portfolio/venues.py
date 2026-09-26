@@ -32,10 +32,13 @@ class CoinTransport:
                     timeout=aiohttp.ClientTimeout(total=timeout)) as response:
                 if 300 <= response.status < 400:
                     raise ValueError("Redirect rejected")
-                raw = await response.content.read(4_000_001)
-                if len(raw) > 4_000_000:
-                    raise ValueError("Response too large")
-                return HttpResponse(response.status, dict(response.headers), raw.decode())
+                chunks, size = [], 0
+                async for chunk in response.content.iter_chunked(65536):
+                    size += len(chunk)
+                    if size > 4_000_000:
+                        raise ValueError("Response too large")
+                    chunks.append(chunk)
+                return HttpResponse(response.status, dict(response.headers), b"".join(chunks).decode())
         except Exception:
             raise GatewayError("COIN-M transport failed", maybe_sent=method != "GET") from None
 
@@ -50,13 +53,23 @@ class Venues:
         secret = credentials.api_secret if credentials else ""
         self.config, self.allow_orders = config, allow_orders
         self.stop_requested = lambda: False
-        self.spots = {s: SpotGateway(s, key, secret, allow_orders) for s in config.symbols}
+        self.spots = {s: SpotGateway(s, key, secret, allow_orders, intraday=config.strategy_mode == "intraday") for s in config.symbols}
         for gateway in self.spots.values():
             gateway.submission_guard = lambda: not self.stop_requested()
         self.rest = BinanceRestClient("https://dapi.binance.com", key, secret,
             transport=CoinTransport(), mutation_guard=self.guard)
         self.coin = BinanceGateway(self.rest, "live")
         self.spec = None
+        self._info_cache = None
+        self._fee_cache = None
+
+    async def _market_metadata(self):
+        if self._info_cache and time.monotonic()-self._info_cache[0] < 300:
+            return self._info_cache[1]
+        info = await self.rest.get_public("/dapi/v1/exchangeInfo")
+        resolve_contract(info, "BTCUSD_PERP")
+        self._info_cache = (time.monotonic(), info)
+        return info
 
     def guard(self, method, path, params):
         if not self.allow_orders or self.stop_requested():
@@ -73,11 +86,12 @@ class Venues:
     async def markets(self):
         await self.rest.sync_time()
         received = time.time_ns()//1_000_000
+        intraday = self.config.strategy_mode == "intraday"
         info, book, premium, rows = await asyncio.gather(
-            self.rest.get_public("/dapi/v1/exchangeInfo"),
+            self._market_metadata(),
             self.rest.get_public("/dapi/v1/ticker/bookTicker", {"symbol": "BTCUSD_PERP"}),
             self.rest.get_public("/dapi/v1/premiumIndex", {"symbol": "BTCUSD_PERP"}),
-            self.rest.get_public("/dapi/v1/klines", {"symbol": "BTCUSD_PERP", "interval": "4h", "limit": 300}))
+            self.rest.get_public("/dapi/v1/klines", {"symbol": "BTCUSD_PERP", "interval": "5m" if intraday else "4h", "limit": 120 if intraday else 300}))
         self.spec = resolve_contract(info, "BTCUSD_PERP")
         book = book[0] if isinstance(book, list) and len(book) == 1 else book
         premium = premium[0] if isinstance(premium, list) and len(premium) == 1 else premium
@@ -89,6 +103,8 @@ class Venues:
         result = {"coinm": {"symbol": self.spec.symbol, "bid": str(bid), "ask": str(ask),
             "mark": str(mark), "klines": rows, "server_time_ms": self.rest.now_ms(),
             "received_at_ms": received, "spec": self.spec}}
+        if intraday:
+            result["coinm"]["trend_klines"] = await self.rest.get_public("/dapi/v1/klines", {"symbol": "BTCUSD_PERP", "interval": "1h", "limit": 120})
         result["spot"] = dict(zip(self.spots, await asyncio.gather(*(g.market() for g in self.spots.values()))))
         return result
 
@@ -103,17 +119,22 @@ class Venues:
         position = next((p for p in positions if p.position_side == "BOTH"), None)
         if position is None:
             raise ValueError("Missing one-way position metadata")
-        return {"spot": spot, "permissions": permissions, "spot_orders": orders,
+        bnb_burn = await first.bnb_burn_status() if self.config.strategy_mode == "aggressive" else None
+        return {"spot": spot, "permissions": permissions, "spot_bnb_burn": bnb_burn, "spot_orders": orders,
                 "coin": coin, "hedge_mode": mode, "position": position,
                 "coin_orders": coin_orders, "algos": algos}
 
     async def fees(self):
+        if self._fee_cache and time.monotonic()-self._fee_cache[0] < 60:
+            return self._fee_cache[1]
         spot = dict(zip(self.spots, await asyncio.gather(*(g.commission_rate() for g in self.spots.values()))))
         _, taker = await self.coin.get_commission_rate("BTCUSD_PERP")
         coin = number(taker)
         if not 0 <= coin < Decimal(".01"):
             raise ValueError("Invalid COIN-M commission")
-        return {"spot": spot, "coinm": coin}
+        result = {"spot": spot, "coinm": coin}
+        self._fee_cache = (time.monotonic(), result)
+        return result
 
     async def submit(self, ident, venue, request):
         if venue == "spot":

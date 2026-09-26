@@ -43,6 +43,25 @@ def safe_error(exc):
     code = getattr(exc, "code", None)
     if isinstance(code, int):
         value["error_code"] = code
+    # A source location identifies intermittent failures without exposing an
+    # exchange response, signed URL, credential, or local filesystem path.
+    tb = exc.__traceback__
+    while tb is not None:
+        filename = Path(tb.tb_frame.f_code.co_filename)
+        if any(part in {"btc_portfolio", "btc_spot", "binance_coinm_v1"} for part in filename.parts):
+            value["error_site"] = f"{filename.parent.name}.{filename.stem}:{tb.tb_lineno}"
+        if filename.parent.name == "btc_portfolio" and filename.stem == "signals" and tb.tb_frame.f_code.co_name == "closed":
+            frame = tb.tb_frame.f_locals
+            rows = frame.get("rows")
+            value["candle_shape"] = {"period_ms": frame.get("period"), "container": type(rows).__name__}
+            if isinstance(rows, list):
+                value["candle_shape"]["count"] = len(rows)
+                for index, row in enumerate(rows):
+                    if not isinstance(row, (list, tuple)) or len(row) <= 6 or row[0] is None or row[6] is None:
+                        value["candle_shape"]["first_bad_index"] = index
+                        value["candle_shape"]["row_type"] = type(row).__name__
+                        break
+        tb = tb.tb_next
     return value
 
 

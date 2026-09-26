@@ -1,4 +1,5 @@
 """One owner for BTC budgets, persisted IOC intents and exchange-held futures stops."""
+import asyncio
 import hashlib
 import json
 import time
@@ -10,6 +11,25 @@ from .signals import alt_signal, coinm_signal
 
 D = Decimal
 TERMINAL = {"FILLED", "EXPIRED", "CANCELED", "REJECTED", "EXPIRED_IN_MATCH"}
+
+
+def allocation_snapshot(config, spot_equity, coinm_equity):
+    """Report drift against the initial venue weights without moving funds."""
+    spot, coin = number(spot_equity), number(coinm_equity)
+    total = spot + coin
+    if total <= 0:
+        raise ValueError("Portfolio BTC equity must be positive")
+    target_spot = (number(config.spot_fraction) if config.strategy_mode == "aggressive"
+                   else number(config.spot_btc) / config.total)
+    spot_excess = spot - total * target_spot
+    threshold = total*D("0.05") if config.strategy_mode == "aggressive" else max(total * D("0.05"), D("0.0001"))
+    return {"spot_equity_btc": str(spot), "coinm_equity_btc": str(coin),
+            "spot_weight_pct": str(spot / total * 100),
+            "coinm_weight_pct": str(coin / total * 100),
+            "target_spot_weight_pct": str(target_spot * 100),
+            "target_coinm_weight_pct": str((1-target_spot) * 100),
+            "spot_excess_btc": str(spot_excess),
+            "rebalance_review": abs(spot_excess) >= threshold}
 
 
 def fresh(market):
@@ -63,10 +83,17 @@ class Engine:
             reasons.append("account_trading_disabled")
         if perms.get("enableSpotAndMarginTrading") is not True or perms.get("enableFutures") is not True:
             reasons.append("spot_and_futures_permissions_required")
+        if self.c.strategy_mode == "aggressive" and account.get("spot_bnb_burn") is not False:
+            reasons.append("disable_spot_bnb_fee_payment_before_aggressive_trading")
+        if (self.c.strategy_mode == "aggressive" and self.c.rebalance_mode == "auto"
+                and perms.get("permitsUniversalTransfer") is not True):
+            reasons.append("auto_rebalance_requires_universal_transfer_permission")
         if account["hedge_mode"] or position.position_side != "BOTH" or position.margin_type != "isolated":
             reasons.append("coinm_requires_existing_isolated_one_way_configuration")
         if not 1 <= position.leverage <= self.c.max_leverage:
             reasons.append("coinm_leverage_above_configured_limit")
+        if self.c.strategy_mode == "aggressive" and number(self.c.spot_fraction) < 1 and position.leverage != 3:
+            reasons.append("aggressive_coinm_requires_exchange_leverage_3")
         if any(p.position_amt for p in coin.positions if p.symbol != "BTCUSD_PERP"):
             reasons.append("other_futures_positions_present")
         if account["spot_orders"] or account["coin_orders"]:
@@ -76,6 +103,12 @@ class Engine:
         owned_stop = (self.s.get("stop") or {}).get("id") if self.s else None
         if any(a.client_id != owned_stop for a in account["algos"]):
             reasons.append("foreign_conditional_orders_present")
+        if self.c.strategy_mode == "intraday" and self.s and self.s.get("wallet") is not None:
+            entry = self.s.get("alt_entry") or {}
+            if any(number(v) > 0 for a, v in self.s.get("wallet").items() if a != "BTC") and not entry.get("entered_at_ms"):
+                reasons.append("intraday_spot_entry_metadata_migration_required")
+            if position.position_amt and not (self.s.get("position_entry") or {}).get("entered_at_ms"):
+                reasons.append("intraday_coinm_entry_metadata_migration_required")
         if not self.s or self.s.get("wallet") is None:
             if position.position_amt:
                 reasons.append("unowned_coinm_position")
@@ -161,7 +194,11 @@ class Engine:
                 if done:
                     self.s.complete(ident, order)
                     if req["side"] == "BUY" and executed:
-                        self.s.put("alt_entry", {"symbol": req["symbol"], "price": str(cumulative/executed)})
+                        self.s.put("alt_entry", {"symbol": req["symbol"], "price": str(cumulative/executed),
+                            "stop_fraction": req.get("stop_fraction", self.c.alt_stop_fraction),
+                            "entered_at_ms": intent["created_ms"]})
+                    elif req["side"] == "SELL" and executed and self.c.strategy_mode == "intraday":
+                        self.s.put("spot_cooldown_until", time.time_ns()//1_000_000+self.c.intraday_cooldown_seconds*1000)
             return done
         order = await self.v.coin.get_order("BTCUSD_PERP", ident)
         if order.status == "NOT_FOUND":
@@ -187,7 +224,19 @@ class Engine:
             if done:
                 self.s.complete(ident, order.raw)
                 if not req.get("reduce_only") and qty:
-                    self.s.put("position_stop", req["stop"])
+                    if not req.get("aggressive_resize"):
+                        price = qty/sum((f.qty/number(f.price) for f in rows), D(0))
+                        stop_price = req["stop"]
+                        if (self.c.strategy_mode == "aggressive" and self.s.get("stop") is None
+                                and getattr(self.v, "spec", None) is not None):
+                            direction = 1 if req["side"] == "BUY" else -1
+                            stop_price = str(self.v.spec.round_price_away(
+                                price*(1-direction*number(self.c.stop_fraction)), direction, True))
+                        self.s.put("position_stop", stop_price)
+                        self.s.put("position_entry", {"price": str(price), "stop_fraction": str(abs(1-number(stop_price)/price)),
+                                   "entered_at_ms": intent["created_ms"]})
+                elif req.get("reduce_only") and qty and self.c.strategy_mode == "intraday":
+                    self.s.put("coin_cooldown_until", time.time_ns()//1_000_000+self.c.intraday_cooldown_seconds*1000)
         return done
 
     async def submit(self, venue, key, req):
@@ -249,10 +298,15 @@ class Engine:
                             self.s.fill("coinm", f.symbol, f.trade_id, f.__dict__)
                         self.s.put("coin_qty", "0")
                         self.s.event("stop_filled", {"id": stop["id"]})
+                        if self.c.strategy_mode == "aggressive":
+                            self.s.put("aggressive_blocked_side", 1 if stop["side"] == "SELL" else -1)
+                        if self.c.strategy_mode == "intraday":
+                            self.s.put("coin_cooldown_until", time.time_ns()//1_000_000+self.c.intraday_cooldown_seconds*1000)
                 self.s.put("stop", None)
             elif number(self.s.get("coin_qty", "0")):
                 raise ValueError("COIN-M position disappeared without owned stop or close fills")
             self.s.put("position_stop", None)
+            self.s.put("position_entry", None)
             return
         expected = number(self.s.get("coin_qty", "0"))
         pending_entry = next((json.loads(p["request"]) for p in self.s.pending()
@@ -279,10 +333,32 @@ class Engine:
             await self.v.stop(ident, side, price)
         except Exception as exc:
             self.s.event("stop_submission_error", {"error_type": type(exc).__name__})
-        observed = await self.v.coin.get_algo_order("BTCUSD_PERP", ident)
-        if observed.status != "NEW" or not observed.close_position or observed.side != side:
-            self.s.put("halt", "protection_not_confirmed")
-            raise ValueError("COIN-M protection not confirmed")
+        # Binance may accept a conditional order before it becomes visible to
+        # GET /algoOrder. Never POST again: reconcile the persisted client ID.
+        observed = None
+        for attempt in range(5):
+            try:
+                observed = await self.v.coin.get_algo_order("BTCUSD_PERP", ident)
+            except Exception as exc:
+                self.s.event("stop_lookup_error", {"error_type": type(exc).__name__, "attempt": attempt + 1})
+            else:
+                if (observed.status == "NEW" and observed.client_id == ident
+                        and observed.symbol == "BTCUSD_PERP" and observed.order_type == "STOP_MARKET"
+                        and observed.close_position and observed.side == side
+                        and observed.working_type == "MARK_PRICE"
+                        and number(observed.trigger_price) == number(price)):
+                    return
+                if observed.status not in {"NOT_FOUND", "NEW"}:
+                    break
+            if attempt < 4:
+                await asyncio.sleep(0.2)
+        self.s.event("stop_confirmation_failed", {"id": ident,
+            "status": observed.status if observed else "LOOKUP_ERROR",
+            "side": observed.side if observed else None,
+            "close_position": observed.close_position if observed else None,
+            "working_type": observed.working_type if observed else None})
+        self.s.put("halt", "protection_not_confirmed")
+        raise ValueError("COIN-M protection not confirmed")
 
     def equity(self, account, markets):
         wallet = self.s.get("wallet")
@@ -309,15 +385,24 @@ class Engine:
             return {"status": "BLOCKED", "reason": self.s.get("halt")}
         markets, fees = await self.v.markets(), await self.v.fees()
         equity = self.equity(account, markets)
+        coinm_equity = number(account["coin"].asset("BTC").margin_balance)
+        allocation = allocation_snapshot(self.c, equity-coinm_equity, coinm_equity)
         day = int(markets["coinm"]["server_time_ms"])//86_400_000
         day_start = self.s.get("day_start")
         if not day_start or day_start["day"] != day:
             day_start = {"day": day, "equity": str(equity)}
             self.s.put("day_start", day_start)
         can_enter = equity > number(day_start["equity"])*(1-number(self.c.daily_loss_fraction))
+        if self.c.strategy_mode == "intraday":
+            from .intraday import execute
+            return await execute(self, account, markets, fees, equity, can_enter, allocation)
+        if self.c.strategy_mode == "aggressive":
+            from .aggressive import execute
+            return await execute(self, account, markets, fees, equity)
         alt, coin = alt_signal(markets["spot"]), coinm_signal(markets["coinm"])
         result = {"status": "READY", "equity_btc": str(equity), "new_entries_allowed": can_enter,
-                  "btc_usd_reference": markets["coinm"]["mark"], "alt_signal": alt, "coinm_signal": coin}
+                  "btc_usd_reference": markets["coinm"]["mark"], "alt_signal": alt, "coinm_signal": coin,
+                  "allocation": allocation}
         # Exit an alt on a stop at every poll, or rotate after a completed daily signal.
         entry = self.s.get("alt_entry")
         holdings = []
@@ -370,7 +455,7 @@ class Engine:
         self.s.event("evaluation", result)
         return result
 
-    async def spot_trade(self, symbol, target, market, fee, account, key):
+    async def spot_trade(self, symbol, target, market, fee, account, key, *, stop_fraction=None):
         if (market.get("symbol") != symbol or market.get("base_asset") != symbol[:-3]
                 or market.get("quote_asset") != "BTC" or market.get("status") != "TRADING"
                 or market.get("spot_allowed") is not True):
@@ -382,6 +467,7 @@ class Engine:
             return plan
         market["account_filters"] = await self.v.spots[symbol].relevant_filters()
         validate_plan_filters(market, plan, account["spot"], "live")
+        metadata = {"stop_fraction": str(stop_fraction)} if stop_fraction is not None else {}
         await self.submit("spot", symbol+":"+key, {"symbol": symbol, "side": plan["side"],
-            "quantity": plan["quantity"], "price": plan["limit_price"], "_market": market})
+            "quantity": plan["quantity"], "price": plan["limit_price"], "_market": market, **metadata})
         return {"status": "SUBMITTED", "symbol": symbol, "side": plan["side"], "quantity": plan["quantity"]}

@@ -60,10 +60,33 @@ async def prepare(venues, config, directory):
             blockers.append("portfolio_ledger_binding_changed")
         if store and store.get("halt"):
             blockers.append("portfolio_halted:"+store.get("halt"))
-        coin = coinm_signal(markets["coinm"])
+        if config.strategy_mode == "intraday":
+            from .intraday import signals
+            alt, coin = signals(markets, fees)
+        elif config.strategy_mode == "aggressive":
+            from .aggressive import preview as aggressive_preview
+            view = aggressive_preview(config, markets, account, store.get("wallet") if store else None)
+            alt, coin = view["alt_signal"], view["coinm_signal"]
+            if not store:
+                blockers.append("registered_swing_ledger_required_for_migration")
+            if store and store.get("binding") != {"identity": config.identity(), "mode": "live"}:
+                blockers.append("explicit_aggressive_ledger_migration_required")
+            if store and store.get("aggressive_transfer", {}).get("phase") == "PENDING":
+                blockers.append("transfer_outcome_requires_manual_reconciliation")
+            result = {"mode": "prepare", "orders_submitted": 0, "transfers_submitted": 0,
+                      "identity": config.identity(), "config": asdict(config), "ready": not blockers,
+                      "blockers": list(dict.fromkeys(blockers)), **view,
+                      "coinm_margin_type": account["position"].margin_type,
+                      "coinm_leverage": account["position"].leverage,
+                      "spot_bnb_burn": account.get("spot_bnb_burn"),
+                      "universal_transfer_permission": account["permissions"].get("permitsUniversalTransfer"),
+                      "updated_at_ms": time.time_ns()//1_000_000}
+            atomic_json(directory/"readiness.json", result)
+            return result
+        else:
+            alt, coin = alt_signal(markets["spot"]), coinm_signal(markets["coinm"])
         from btc_spot.store import number
         from .filters import validate_plan_filters, plan_order
-        alt = alt_signal(markets["spot"])
         alt_preview = {"status": "SKIP", "reason": "all_alts_underperform_btc"}
         if alt["symbol"]:
             symbol = alt["symbol"]
@@ -71,7 +94,7 @@ async def prepare(venues, config, directory):
             wallet = store.get("wallet") if store else None
             btc = number(wallet["BTC"] if wallet else config.spot_btc)
             allocation = min(number(config.spot_btc)*number(config.alt_max_fraction),
-                config.total*number(config.risk_fraction)/(number(config.alt_stop_fraction)+2*fees["spot"][symbol]+number(".001")))
+                config.total*number(config.risk_fraction)/(number(alt.get("stop_fraction") or config.alt_stop_fraction)+2*fees["spot"][symbol]+number(".001")))
             alt_preview = plan_order(btc_balance=wallet[symbol[:-3]] if wallet else 0, quote_balance=btc,
                 target_btc_fraction=min(number(1), allocation/btc) if btc else 0, market=market, fee_rate=fees["spot"][symbol])
             market["account_filters"] = await venues.spots[symbol].relevant_filters()
@@ -139,6 +162,8 @@ async def run(venues, config, directory, *, once=False, poll_seconds=30):
         store = Store(directory/"ledger.sqlite3", config.identity(), "live")
         engine = Engine(venues, store, config)
         while not venues.stop_requested():
+            cycle_started = time.monotonic()
+            delay = poll_seconds
             try:
                 result = await engine.tick()
             except Exception as exc:
@@ -146,8 +171,17 @@ async def run(venues, config, directory, *, once=False, poll_seconds=30):
                 # Only our own fixed validation messages; provider messages are never logged.
                 if type(exc) is ValueError:
                     result["reason"] = str(exc)
+                from binance_coinm_v1.exchange.errors import RateLimited
+                if isinstance(exc, RateLimited) or getattr(exc, "status", None) in (418, 429):
+                    import math
+                    retry = getattr(exc, "retry_after", None)
+                    delay = max(60, float(retry)) if isinstance(retry, (int, float)) and math.isfinite(retry) else 60
+                    if getattr(exc, "banned", False) or getattr(exc, "status", None) == 418:
+                        delay = max(3600, delay)
+                    result["retry_after_seconds"] = delay
                 store.event("runtime_error", result)
             state = {"mode": "live", "orders_enabled": True, "updated_at_ms": time.time_ns()//1_000_000,
+                     "strategy_mode": config.strategy_mode, "evaluation_interval_seconds": poll_seconds,
                      "result": result, "wallet": store.get("wallet"), "coin_qty": store.get("coin_qty"),
                      "stop": store.get("stop"), "halt": store.get("halt"), "pending": len(store.pending())}
             atomic_json(directory/"status.json", state)
@@ -155,7 +189,8 @@ async def run(venues, config, directory, *, once=False, poll_seconds=30):
             if once:
                 return state
             try:
-                await asyncio.wait_for(stop.wait(), timeout=poll_seconds)
+                wait = delay if result.get("retry_after_seconds") else max(.1, delay-(time.monotonic()-cycle_started))
+                await asyncio.wait_for(stop.wait(), timeout=wait)
             except asyncio.TimeoutError:
                 pass
     finally:

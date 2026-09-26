@@ -212,6 +212,56 @@ def test_stop_rejection_emergency_is_reduce_only_and_persisted(setup):
     assert store.get("halt") and store.pending()
 
 
+def test_stop_acknowledged_before_get_visibility_does_not_repost_or_emergency_close(setup, monkeypatch):
+    engine, venues, store = setup
+    run(engine.submit("coinm", "entry", {"symbol": "BTCUSD_PERP", "side": "BUY", "quantity": "1",
+        "price": "80000", "stop": "79000", "reduce_only": False, "_market": spot_market()}))
+    original = venues.coin.get_algo_order
+    attempts = []
+
+    async def delayed(symbol, ident):
+        attempts.append(ident)
+        if len(attempts) < 3:
+            return OrderState.not_found(ident, symbol, True)
+        return await original(symbol, ident)
+
+    async def no_wait(_):
+        pass
+
+    monkeypatch.setattr(venues.coin, "get_algo_order", delayed)
+    monkeypatch.setattr("btc_portfolio.engine.asyncio.sleep", no_wait)
+    run(engine.protect(run(venues.account())))
+    assert len(attempts) == 3
+    assert len(venues.coin.stops) == 1
+    assert len(venues.posts) == 1
+    assert venues.position == 1
+    assert store.get("halt") is None
+
+
+def test_stop_never_visible_emergency_closes_without_reposting(setup, monkeypatch):
+    engine, venues, store = setup
+    run(engine.submit("coinm", "entry", {"symbol": "BTCUSD_PERP", "side": "BUY", "quantity": "1",
+        "price": "80000", "stop": "79000", "reduce_only": False, "_market": spot_market()}))
+    attempts = []
+
+    async def invisible(symbol, ident):
+        attempts.append(ident)
+        return OrderState.not_found(ident, symbol, True)
+
+    async def no_wait(_):
+        pass
+
+    monkeypatch.setattr(venues.coin, "get_algo_order", invisible)
+    monkeypatch.setattr("btc_portfolio.engine.asyncio.sleep", no_wait)
+    with pytest.raises(ValueError, match="protection not confirmed"):
+        run(engine.protect(run(venues.account())))
+    assert len(attempts) == 5
+    assert len(venues.coin.stops) == 1
+    assert len(venues.posts) == 2
+    assert venues.posts[-1][2]["reduce_only"] and venues.posts[-1][2]["emergency"]
+    assert store.get("halt") == "protection_failed_emergency_close_requested"
+
+
 def test_external_balance_drift_is_not_adopted(setup):
     engine, venues, store = setup
     venues.assets["BTC"] += D(".0001")
@@ -291,6 +341,18 @@ def test_configuration_cannot_silently_increase_risk():
         Config(risk_fraction=".5")
     with pytest.raises(ValueError):
         Config(spot_btc="NaN")
+
+
+def test_allocation_review_reports_material_drift_without_changing_budgets():
+    from btc_portfolio.engine import allocation_snapshot
+    config = Config()
+    initial = allocation_snapshot(config, D(".0012"), D(".0018"))
+    assert initial["spot_weight_pct"] == "40.0"
+    assert initial["rebalance_review"] is False
+    grown = allocation_snapshot(config, D(".0016"), D(".0018"))
+    assert grown["rebalance_review"] is True
+    assert D(grown["spot_excess_btc"]) == D(".00024")
+    assert config.spot_btc == "0.0012" and config.coinm_btc == "0.0018"
 
 
 def test_ledger_binding_rejects_strategy_or_budget_change(tmp_path):
@@ -373,3 +435,36 @@ def test_flat_position_clears_old_stop_price_before_next_entry(setup):
     store.put("position_stop", "100000")
     run(engine.protect(run(venues.account())))
     assert store.get("position_stop") is None
+
+
+def test_intraday_can_exit_and_reenter_same_day_after_cooldown(setup, monkeypatch):
+    from dataclasses import replace
+    from btc_portfolio import intraday
+    engine, venues, store = setup
+    engine.c = replace(engine.c, strategy_mode="intraday")
+    now = int(time.time()*1000)
+    quote = spot_market()
+    signal = {"bar":"one","symbol":"ETHBTC","stop_fraction":".01","scores":{},
+              "details":{"ETHBTC":{"exit_long":False,"exit_short":False}}}
+    coin = {"bar":"one","direction":0,"stop_fraction":".01","exit_long":False,"exit_short":False}
+    monkeypatch.setattr(intraday,"signals",lambda *_: (deepcopy(signal),deepcopy(coin)))
+    async def markets():
+        return {"spot":{"ETHBTC":deepcopy(quote)},"coinm":{"mark":"80000","spec":None,"server_time_ms":now}}
+    async def fees():
+        return {"spot":{"ETHBTC":D(".001")},"coinm":D(".0005")}
+    venues.markets, venues.fees = markets, fees
+    assert run(engine.tick())["action"]["side"] == "BUY"
+    assert store.get("alt_entry")["entered_at_ms"]
+    signal["symbol"] = None
+    run(engine.tick())
+    assert len(venues.posts) == 1  # No new breakout does not mean sell the holding.
+    quote["bid"] = quote["ask"] = ".029"
+    assert run(engine.tick())["exit_reason"] == "stop_loss"
+    assert venues.posts[-1][2]["side"] == "SELL"
+    signal.update(symbol="ETHBTC",bar="two")
+    result = run(engine.tick())
+    assert result["cooldown_ms"]["spot"] > 0
+    assert len(venues.posts) == 2
+    store.put("spot_cooldown_until",now-1)
+    assert run(engine.tick())["action"]["side"] == "BUY"
+    assert len(venues.posts) == 3

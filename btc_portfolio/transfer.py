@@ -1,4 +1,4 @@
-"""One-time, explicit Spot -> COIN-M BTC funding through Binance universal transfer.
+"""BTC internal transfers with a persisted intent before exactly one POST.
 
 This is deliberately separate from the trading loop. An ambiguous response is
 never retried: the intent file must be reconciled with Binance first.
@@ -75,13 +75,15 @@ def plan(config, account, reserve_btc, blockers=()):
             "ready": not reasons, "blockers": reasons, "orders_submitted": 0, "transfers_submitted": 0}
 
 
-async def signed_transfer(gateway, amount):
-    """Exactly one POST. The only destination/type here is MAIN_CMFUTURE BTC."""
+async def signed_transfer(gateway, amount, direction="MAIN_CMFUTURE"):
+    """Exactly one POST for either BTC Spot/COIN-M transfer direction."""
     amount = number(amount)
+    if direction not in {"MAIN_CMFUTURE", "CMFUTURE_MAIN"}:
+        raise ValueError("Unsupported internal transfer direction")
     if amount <= 0 or amount.as_tuple().exponent < -8:
         raise ValueError("BTC transfer amount must be positive with at most 8 decimal places")
     server_ms = await gateway._sync_time(force=True)
-    params = {"type": "MAIN_CMFUTURE", "asset": "BTC", "amount": format(amount, "f"),
+    params = {"type": direction, "asset": "BTC", "amount": format(amount, "f"),
               "timestamp": server_ms, "recvWindow": 5000}
     body = urlencode(params)
     signature = hmac.new(gateway._api_secret.encode(), body.encode(), hashlib.sha256).hexdigest()
@@ -98,6 +100,98 @@ async def signed_transfer(gateway, amount):
     except (ValueError, KeyError, TypeError):
         raise ValueError("Binance transfer response has no valid transaction ID; outcome requires reconciliation") from None
     return tran_id
+
+
+async def transfer_history(gateway, direction, since_ms):
+    """Read-only exchange history for human reconciliation of an uncertain intent."""
+    if direction not in {"MAIN_CMFUTURE", "CMFUTURE_MAIN"}:
+        raise ValueError("Unsupported transfer history direction")
+    since_ms = int(since_ms)
+    now = await gateway._sync_time(force=True)
+    if not 0 < since_ms <= now or now-since_ms > 30*86_400_000:
+        raise ValueError("Transfer history start time is outside the supported review window")
+    params = {"type": direction, "startTime": max(0, since_ms-60_000),
+              "endTime": now, "size": 100, "timestamp": now, "recvWindow": 5000}
+    query = urlencode(params)
+    signature = hmac.new(gateway._api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+    response = await gateway.transport.request("GET", BASE_URL+"/sapi/v1/asset/transfer?"+query+"&signature="+signature,
+                                               {"X-MBX-APIKEY": gateway._api_key}, 10.0)
+    if response.status != 200:
+        raise ValueError("Binance transfer history unavailable")
+    payload = json.loads(response.text)
+    if not isinstance(payload.get("rows"), list):
+        raise ValueError("Malformed transfer history")
+    return [{"tran_id": row.get("tranId"), "type": row.get("type"), "asset": row.get("asset"),
+             "amount": row.get("amount"), "status": row.get("status"), "timestamp": row.get("timestamp")}
+            for row in payload["rows"] if row.get("type") == direction and row.get("asset") == "BTC"]
+
+
+async def rebalance_live(engine, account, markets, fees, difference, month_key):
+    """One live service step. PENDING is never resent after any ambiguous POST."""
+    from decimal import Decimal as D, ROUND_DOWN
+
+    s, c = engine.s, engine.c
+    pending = s.get("aggressive_transfer")
+    if pending and pending.get("phase") == "PENDING":
+        return {"status": "BLOCKED", "reason": "transfer_outcome_requires_manual_reconciliation"}
+    if account["permissions"].get("permitsUniversalTransfer") is not True:
+        return {"status": "BLOCKED", "reason": "universal_transfer_permission_required"}
+    difference = number(difference)
+    wallet = s.get("wallet")
+    spot_cash = number(wallet["BTC"])
+    if difference > 0:
+        direction, amount = "MAIN_CMFUTURE", difference
+        if spot_cash < amount:
+            attempt_key = "aggressive_rebalance_sells:"+month_key
+            if s.get(attempt_key, 0) >= 3:
+                return {"status": "BLOCKED", "reason": "rebalance_spot_sell_retry_limit"}
+            held = max(c.symbols, key=lambda sym: number(wallet[sym[:-3]])*number(markets["spot"][sym]["bid"]))
+            market = markets["spot"][held]
+            value = number(wallet[held[:-3]])*number(market["bid"])
+            if value <= 0:
+                return {"status": "BLOCKED", "reason": "insufficient_owned_spot_btc"}
+            target = max(D(0), (value-(amount-spot_cash)*D("1.01"))/(value+spot_cash))
+            outcome = await engine.spot_trade(held, target, market, fees["spot"][held], account,
+                                              "rebalance_sell:"+month_key+":"+str(s.get(attempt_key, 0)))
+            if outcome["status"] == "SUBMITTED":
+                s.put(attempt_key, s.get(attempt_key, 0)+1)
+            return {"status": "SPOT_SELL_FOR_TRANSFER", "order": outcome}
+        if number(next((r["free"] for r in account["spot"]["balances"] if r["asset"] == "BTC"), "0")) < amount:
+            return {"status": "BLOCKED", "reason": "spot_btc_not_available"}
+    else:
+        direction, amount = "CMFUTURE_MAIN", -difference
+        asset, pos = account["coin"].asset("BTC"), account["position"]
+        market = markets["coinm"]
+        exposure = abs(pos.position_amt)*market["spec"].contract_size/number(market["mark"])
+        max_by_leverage = number(asset.margin_balance)-exposure/max(D("2.5"), number(c.leverage_max))
+        max_by_wallet = number(asset.wallet_balance)-number(asset.position_initial_margin)-D("0.00001")
+        amount = min(amount, number(asset.available_balance), max_by_leverage, max_by_wallet)
+        if amount <= 0:
+            return {"status": "BLOCKED", "reason": "insufficient_coinm_transferable_btc"}
+    amount = amount.quantize(D("0.00000001"), rounding=ROUND_DOWN)
+    if amount <= 0:
+        return {"status": "BLOCKED", "reason": "transfer_below_btc_precision"}
+    intent = {"phase": "PENDING", "type": direction, "asset": "BTC", "amount": str(amount),
+              "month": month_key, "account_uid_hash": hashlib.sha256(str(account["spot"]["uid"]).encode()).hexdigest(),
+              "spot_btc_before": str(spot_cash), "coin_wallet_before": str(account["coin"].asset("BTC").wallet_balance),
+              "created_ms": time.time_ns()//1_000_000}
+    s.put("aggressive_transfer", intent)
+    s.event("aggressive_transfer_intent", intent)
+    gateway = next(iter(engine.v.spots.values()))
+    try:
+        tran_id = await signed_transfer(gateway, amount, direction)
+    except Exception as exc:
+        s.event("aggressive_transfer_uncertain", {"type": direction, "error_type": type(exc).__name__})
+        s.put("halt", "transfer_outcome_requires_manual_reconciliation")
+        return {"status": "PENDING", "reason": "transfer_outcome_requires_manual_reconciliation"}
+    with s.transaction():
+        updated = dict(s.get("wallet"))
+        updated["BTC"] = str(number(updated["BTC"])+(-amount if direction == "MAIN_CMFUTURE" else amount))
+        intent.update(phase="ACKNOWLEDGED", tran_id=tran_id)
+        s.put("wallet", updated)
+        s.put("aggressive_transfer", intent)
+        s.event("aggressive_transfer_acknowledged", intent)
+    return {"status": "ACKNOWLEDGED", "type": direction, "amount_btc": str(amount), "tran_id": tran_id}
 
 
 async def dispatch(args):

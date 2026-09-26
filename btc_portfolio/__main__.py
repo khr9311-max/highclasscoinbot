@@ -20,6 +20,19 @@ async def dispatch(args):
     try:
         if args.action == "observe":
             markets = await venues.markets()
+            if config.strategy_mode == "intraday":
+                from .intraday import signals
+                from decimal import Decimal
+                assumed = {"spot": {s: Decimal(".0015") for s in config.symbols}, "coinm": Decimal(".0005")}
+                alt, coin = signals(markets, assumed)
+                return {"orders_submitted": 0, "strategy_mode": "intraday", "fees_assumed": True, "alt": alt, "coinm": coin}
+            if config.strategy_mode == "aggressive":
+                from .aggressive import volatility, target_leverage
+                sigma = volatility(markets["coinm"])
+                return {"orders_submitted": 0, "strategy_mode": "aggressive",
+                        "alt": alt_signal(markets["spot"]), "coinm": coinm_signal(markets["coinm"]),
+                        "sigma": str(sigma), "target_leverage": str(target_leverage(config, sigma)),
+                        "note": "Use authenticated prepare for contracts, liquidation and allocation"}
             return {"orders_submitted": 0, "alt": alt_signal(markets["spot"]), "coinm": coinm_signal(markets["coinm"])}
         if args.action == "prepare":
             return await prepare(venues, config, args.state_dir)
@@ -36,10 +49,12 @@ def main():
     parser.add_argument("--state-dir", type=Path, default=ROOT/"btc_portfolio/state/live")
     parser.add_argument("--confirm", default="")
     parser.add_argument("--once", action="store_true")
-    parser.add_argument("--poll-seconds", type=int, default=30)
+    parser.add_argument("--poll-seconds", type=int)
     args = parser.parse_args()
-    if not 10 <= args.poll_seconds <= 300:
-        parser.error("poll-seconds must be 10..300")
+    if args.poll_seconds is None:
+        args.poll_seconds = 5 if load(args.config).strategy_mode == "intraday" else 30
+    if not 5 <= args.poll_seconds <= 300:
+        parser.error("poll-seconds must be 5..300")
     try:
         result = asyncio.run(dispatch(args))
         print(json.dumps(result, default=str, indent=2))

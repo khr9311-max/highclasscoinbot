@@ -88,6 +88,18 @@ def test_error_output_never_echoes_signed_url():
     assert result == {"error_type":"RuntimeError"}
 
 
+def test_error_output_reports_candle_shape_without_market_data():
+    from btc_portfolio.signals import closed
+    try:
+        closed([None], 86_400_000, 86_400_000, 1)
+    except ValueError as exc:
+        result = safe_error(exc)
+    assert result["error_type"] == "ValueError"
+    assert result["error_site"].startswith("btc_portfolio.signals:")
+    assert result["candle_shape"] == {"period_ms": 86_400_000, "container": "list",
+                                      "count": 1, "first_bad_index": 0, "row_type": "NoneType"}
+
+
 def test_valuation_distinguishes_actual_btc_and_quote():
     value = valuation({"wallet":{"btc":".001", "quote":"100", "reserve_btc":".00112273", "reserve_quote":"0"}},
                       {"ask":"50000"}, Decimal(".001"))

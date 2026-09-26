@@ -49,6 +49,7 @@ _SIGNED = {
     "/api/v3/account/commission": frozenset({"symbol"}),
     "/api/v3/myFilters": frozenset({"symbol"}),
     "/sapi/v1/account/apiRestrictions": frozenset(),
+    "/sapi/v1/bnbBurn": frozenset(),
     "/api/v3/openOrders": frozenset({"symbol"}),
     "/api/v3/order": frozenset({"symbol", "origClientOrderId"}),
     "/api/v3/myTrades": frozenset({"symbol", "orderId", "fromId", "limit"}),
@@ -160,7 +161,7 @@ def _object(value):
 
 
 class SpotGateway:
-    def __init__(self, symbol, api_key="", api_secret="", allow_orders=False, transport=None):
+    def __init__(self, symbol, api_key="", api_secret="", allow_orders=False, transport=None, *, intraday=False):
         if symbol not in ALLOWED:
             raise ValueError("Only configured BTC-quoted alt pairs are supported")
         self.symbol = symbol
@@ -175,6 +176,8 @@ class SpotGateway:
         self._clock_monotonic = 0.0
         self._clock_lock = asyncio.Lock()
         self._closed = False
+        self.intraday = intraday
+        self._metadata_cache = None
 
     def __repr__(self):
         return f"SpotGateway(symbol={self.symbol!r}, allow_orders={self.allow_orders!r})"
@@ -236,8 +239,10 @@ class SpotGateway:
             raise GatewayError("Spot method rejected")
         if "symbol" in params and params["symbol"] != self.symbol:
             raise GatewayError("Spot symbol rejected")
-        if path == "/api/v3/klines" and (params["interval"] != "1d" or params["limit"] != 1000):
-            raise GatewayError("Unsupported candle request")
+        if path == "/api/v3/klines":
+            valid = (params["interval"] in {"5m", "1h"} and params["limit"] == 120) if self.intraday else (params["interval"] == "1d" and params["limit"] == 1000)
+            if not valid:
+                raise GatewayError("Unsupported candle request")
         if path == "/api/v3/myTrades":
             _integer(params["orderId"])
             _integer(params["fromId"])
@@ -327,14 +332,23 @@ class SpotGateway:
             raise GatewayError("Spot GET rejected", code=code, status=status, retry_after=retry_after)
         raise GatewayError("Spot GET retry budget exhausted")
 
+    async def _market_metadata(self):
+        if self._metadata_cache and time.monotonic()-self._metadata_cache[0] < 300:
+            return self._metadata_cache[1]
+        value = _object(await self._request("GET", "/api/v3/exchangeInfo", {"symbol": self.symbol}))
+        if not isinstance(value.get("symbols"), list) or len(value["symbols"]) != 1:
+            raise GatewayError("Unexpected Spot market metadata")
+        self._metadata_cache = (time.monotonic(), value)
+        return value
+
     async def market(self):
         """Fresh public filters/book/reference and up to 1000 UTC daily rows."""
         received_at_ms, fetched_at_monotonic = int(time.time() * 1000), time.monotonic()
         params = {"symbol": self.symbol}
         info, book, klines = await asyncio.gather(
-            self._request("GET", "/api/v3/exchangeInfo", params),
+            self._market_metadata(),
             self._request("GET", "/api/v3/ticker/bookTicker", params),
-            self._request("GET", "/api/v3/klines", {**params, "interval": "1d", "limit": 1000}))
+            self._request("GET", "/api/v3/klines", {**params, "interval": "5m" if self.intraday else "1d", "limit": 120 if self.intraday else 1000}))
         info, book = _object(info), _object(book)
         symbols = info.get("symbols", [])
         if not isinstance(symbols, list) or len(symbols) != 1:
@@ -386,7 +400,9 @@ class SpotGateway:
                 _decimal(value, positive=True)
             previous = opened
         server_time = await self._sync_time(force=True)
+        trend_rows = await self._request("GET", "/api/v3/klines", {**params, "interval": "1h", "limit": 120}) if self.intraday else None
         return {"server_time_ms": server_time, "bid": str(book["bidPrice"]), "ask": str(book["askPrice"]),
+            **({"trend_klines": trend_rows} if self.intraday else {}),
             "reference_price": str(reference), "filters": filters, "klines": klines, "symbol": self.symbol,
             "base_asset": self.base_asset, "quote_asset": self.quote_asset, "status": spec.get("status"),
             "spot_allowed": spec.get("isSpotTradingAllowed") is True,
@@ -419,6 +435,12 @@ class SpotGateway:
 
     async def permissions(self):
         return _object(await self._request("GET", "/sapi/v1/account/apiRestrictions", signed=True))
+
+    async def bnb_burn_status(self):
+        value = _object(await self._request("GET", "/sapi/v1/bnbBurn", signed=True))
+        if type(value.get("spotBNBBurn")) is not bool:
+            raise GatewayError("Missing Spot BNB fee status")
+        return value["spotBNBBurn"]
 
     async def relevant_filters(self):
         return _object(await self._request("GET", "/api/v3/myFilters", {"symbol": self.symbol}, signed=True))

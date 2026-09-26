@@ -1,0 +1,13 @@
+{
+  "strategy_mode": "intraday",
+  "spot_btc": "0.0012",
+  "coinm_btc": "0.0018",
+  "risk_fraction": "0.005",
+  "daily_loss_fraction": "0.02",
+  "alt_max_fraction": "0.25",
+  "coinm_max_exposure": "1.25",
+  "max_leverage": 3,
+  "intraday_cooldown_seconds": 900,
+  "intraday_max_hold_seconds": 14400,
+  "symbols": ["ETHBTC", "BNBBTC", "SOLBTC", "XRPBTC"]
+}

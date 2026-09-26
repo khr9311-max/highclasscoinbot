@@ -106,3 +106,14 @@ def test_inverse_contract_accounting_conserves_btc():
     assert replay.coin_wallet == pytest.approx(0.0018 + gross - fees, abs=1e-15)
     assert replay.stats["fees_btc"] == pytest.approx(fees)
     assert math.isclose(replay.trades[0]["pnl_btc"], gross - qty * 100 / (entry * 1.1) * .0005)
+
+
+def test_spot_tick_rounding_sensitivity_uses_live_limit_price_direction():
+    t = T0 + 62 * bt.DAY
+    data = fake_data(alts=("SOLBTC",), hours=[t], alt_prices={("SOLBTC", t): 0.01})
+    data.tick = {"SOLBTC": 0.001}
+    replay = bt.Portfolio(data, enable_coin=False, spot_tick_rounding=True)
+    replay.alt_buy("SOLBTC", t, 0.003)
+    assert replay.alt_entry == ("SOLBTC", pytest.approx(0.011))
+    replay.alt_sell("SOLBTC", t, 0.0105, "rotate")
+    assert replay.trades[0]["exit"] == pytest.approx(0.010)

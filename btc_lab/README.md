@@ -16,6 +16,9 @@
 COIN-M 유지 구간 개선은 시작 자본에 민감했다. 이후 현물 실행기를 별도로 구현했으며,
 아래 `btc_lab.pc` 명령은 과거 COIN-M 관측용으로 보존한다.
 
+[공격형 포트폴리오 실제 규칙 재현](AGGRESSIVE_BACKTEST_2026-09-25.md)에서 알트 순환 전액 + COIN-M 50:50 조합은
+5년 전체 수익이 알트 순환만(+495%)과 비슷하거나 낮았고, 낙폭과 최근 2년 성과에서 나았다. COIN-M 2배 단독은 타이밍에 극도로 민감했다.
+
 [장중·스윙 전략 사전등록 탐색](STRATEGY_SEARCH_2026-09-25.md)에서 5분·15분·1시간 후보 72개는 검증 구간 플러스가 0개였고,
 현재 장중 대응 모드는 두 구간 모두 크게 손실이었다. 비용을 넘은 후보는 4시간봉·일봉 추세와 일간 알트 순환뿐이었다.
 
@@ -44,6 +47,7 @@ COIN-M 유지 구간 개선은 시작 자본에 민감했다. 이후 현물 실�
 | `small_capital_report.py` | 예비 BTC를 포함한 전체계좌 수익·낙폭 재계산 |
 | `portfolio_backtest.py` | `btc_portfolio` 알트 순환·COIN-M 규칙의 시간봉 과거 재생과 강건성 점검 |
 | `intraday_data.py`, `strategy_search.py` | 5분봉 공개 자료와 장중·스윙 후보 132개의 사전등록 탐색 |
+| `aggressive_backtest.py` | 알트 순환 전액 + COIN-M 추세의 실제 규칙 5분 해상도 재현, 유동 레버리지 비교 |
 | `forward.py`, `pc.py` | 완료 시간봉 기반 종이관측, 상태 저장·중복 실행 방지·PC 시작/정상 종료 |
 | `information.py` | 공식 RSS와 선택적 Gemini 정보 요약. 매매 판단에 연결하지 않음 |
 | `deploy/` | AWS CloudFormation·systemd·설치기·PC 원장 인계 절차 |

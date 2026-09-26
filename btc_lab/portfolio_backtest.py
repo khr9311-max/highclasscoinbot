@@ -8,7 +8,8 @@ mark-price stop, inverse risk sizing in whole contracts, the 2% daily
 new-entry gate and funding. All balances are BTC; holding BTC returns 0%.
 
 Assumptions: IOC orders fill completely at the hourly open with the limit's
-slippage, alt stops fill at the stop level (the bot polls every 30 seconds),
+slippage; the separate spot-tick sensitivity rounds BUY up and SELL down.
+Alt stops fill at the stop level (the bot polls every 30 seconds),
 and today's spot filters and COIN-M contract rules apply to the whole history.
 No credentials are used. `download` performs public GET requests only.
 """
@@ -118,6 +119,7 @@ class Data:
         filters = json.loads((market / "spot_filters.json").read_text())
         pick = lambda s, kind: next(f for f in filters[s] if f["filterType"] == kind)
         self.step = {s: float(pick(s, "LOT_SIZE")["stepSize"]) for s in self.alts}
+        self.tick = {s: float(pick(s, "PRICE_FILTER")["tickSize"]) for s in self.alts}
         self.min_notional = {s: float(pick(s, "NOTIONAL")["minNotional"]) for s in self.alts}
         self._coin, self._alt = {}, {}
 
@@ -168,7 +170,7 @@ class Portfolio:
     def __init__(self, data, *, spot_btc=0.0012, coinm_btc=0.0018, risk=0.005, daily_loss=0.02,
                  alt_stop=0.05, alt_max=0.25, coin_exposure=1.25, spot_fee=0.001, coin_fee=0.0005,
                  slip=0.0003, stop_slip=0.0005, cost_mult=1.0, fractional=False,
-                 enable_alt=True, enable_coin=True):
+                 enable_alt=True, enable_coin=True, spot_tick_rounding=False):
         self.d = data
         self.spot_btc, self.coinm_btc, self.total = spot_btc, coinm_btc, spot_btc + coinm_btc
         self.risk, self.daily_loss = risk, daily_loss
@@ -176,6 +178,7 @@ class Portfolio:
         self.spot_fee, self.coin_fee = spot_fee * cost_mult, coin_fee * cost_mult
         self.slip, self.stop_slip = slip * cost_mult, stop_slip * cost_mult
         self.fractional, self.enable_alt, self.enable_coin = fractional, enable_alt, enable_coin
+        self.spot_tick_rounding = spot_tick_rounding
         self.wallet = {"BTC": spot_btc, **{s[:-3]: 0.0 for s in data.alts}}
         self.alt_entry = self.alt_day = None
         self.coin_wallet, self.coin_qty = coinm_btc, 0.0
@@ -204,6 +207,8 @@ class Portfolio:
         return qty > 0 and qty * self.d.alt_h[s][t][0] * (1 - self.slip) >= self.d.min_notional[s]
 
     def alt_sell(self, s, t, price, reason):
+        if self.spot_tick_rounding:
+            price = floor_step(price, self.d.tick[s])
         qty = floor_step(self.wallet[s[:-3]], self.d.step[s])
         fee = qty * price * self.spot_fee
         self.wallet[s[:-3]] -= qty
@@ -218,6 +223,8 @@ class Portfolio:
 
     def alt_buy(self, s, t, equity):
         price = self.d.alt_h[s][t][0] * (1 + self.slip)
+        if self.spot_tick_rounding:
+            price = math.ceil(price / self.d.tick[s] - 1e-9) * self.d.tick[s]
         allocation = min(self.spot_btc * self.alt_max,
                          min(equity, self.total) * self.risk / (self.alt_stop + 2 * self.spot_fee + 0.001),
                          self.wallet["BTC"] / (1 + self.spot_fee))
@@ -389,6 +396,7 @@ def study(data, output=OUTPUT):
     base = run()
     result["main"] = {
         "portfolio": {**metrics(base.curve, CAPITAL), **base.stats},
+        "portfolio_spot_tick_rounded": metrics(run(spot_tick_rounding=True).curve, CAPITAL),
         "portfolio_cost_x2": metrics(run(cost_mult=2).curve, CAPITAL),
         "btc_spot_momentum": metrics(spot_momentum(start, end), CAPITAL),
         "btc_spot_momentum_cost_x2": metrics(spot_momentum(start, end, 2), CAPITAL)}

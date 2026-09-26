@@ -5,7 +5,12 @@ from btc_spot.store import number
 
 def closed(rows, now, period, minimum):
     end = int(now)//period*period
-    bars = [r for r in rows if int(r[0]) < end and int(r[6]) < int(now)]
+    if not isinstance(rows, list) or not rows or any(not isinstance(r, (list, tuple)) or len(r) < 7 for r in rows):
+        raise ValueError("Malformed candle response")
+    try:
+        bars = [r for r in rows if int(r[0]) < end and int(r[6]) < int(now)]
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("Malformed candle timestamps") from None
     if len(bars) < minimum or int(bars[-1][0]) != end-period:
         raise ValueError("Missing fresh completed candles")
     bars = bars[-minimum:]
