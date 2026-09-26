@@ -68,3 +68,31 @@ def test_long_timeframe_features_do_not_read_future_bars():
     b = ms.long_features(SimpleNamespace(px=later), base)
     for name in a:
         np.testing.assert_array_equal(a[name][:cut + 1], b[name][:cut + 1], err_msg=name)
+
+
+def test_external_features_do_not_read_future_bars():
+    from btc_lab import predict_search as ps
+    rng = np.random.default_rng(11)
+    n, cut = 3000, 2500
+    cm = 50000 * np.exp(np.cumsum(rng.normal(0, 0.002, n)))
+    ext = {"cb_close": cm * (1 + rng.normal(0, 1e-4, n)), "cb_volume": rng.uniform(1, 5, n),
+           "up_btc_close": cm * 1400 * 1.02, "up_usdt_close": np.full(n, 1400.0),
+           "up_btc_volume": rng.uniform(1, 5, n), "dvol": np.where(np.arange(n) % 12 == 11, 50.0, np.nan)}
+    later = {k: v.copy() for k, v in ext.items()}
+    for k in later:
+        later[k][cut + 1:] *= 1.3
+    base = {"vol_288": np.full(n, 0.002)}
+    a, b = ps.external_features(ext, base, cm), ps.external_features(later, base, cm)
+    for name in a:
+        np.testing.assert_array_equal(a[name][:cut + 1], b[name][:cut + 1], err_msg=name)
+    assert abs(np.nanmean(a["kimchi"]) - np.log(1.02)) < 1e-9
+
+
+def test_hourly_dvol_is_known_only_after_the_hour_closes(monkeypatch):
+    from btc_lab import external_data as ed
+    opens = 1_790_208_000_000 + ed.BAR * np.arange(48, dtype=np.int64)
+    monkeypatch.setattr(ed, "START_MS", int(opens[0]))
+    monkeypatch.setattr(ed, "END_MS", int(opens[-1]) + ed.BAR)
+    monkeypatch.setattr(ed, "get", lambda url: {"result": {"data": [[int(opens[0]), 1, 1, 1, 42.0]], "continuation": None}})
+    out = ed.dvol(opens)["dvol"]
+    assert np.isnan(out[:11]).all() and out[11] == 42.0     # the 00:00 candle closes with the 00:55 bar
