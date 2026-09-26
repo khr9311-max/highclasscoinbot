@@ -31,6 +31,7 @@ import time
 
 import numpy as np
 
+from btc_lab import llm_judge
 from btc_lab import regime_switch as rs
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -391,7 +392,7 @@ def open_db(state_dir):
     state_dir = Path(state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(state_dir / "ledger.sqlite3")
-    db.executescript(SCHEMA)
+    db.executescript(SCHEMA + llm_judge.SCHEMA_SQL)
     return db
 
 
@@ -501,9 +502,73 @@ def stats_for(db, now_ms):
     return {"7일": score_stats(db, now_ms - 7 * 86_400_000, 24), "30일": score_stats(db, now_ms - 30 * 86_400_000, 24)}
 
 
+# ---------------------------------------------------------------- beginner report
+
+def read_portfolio(path, now_ms):
+    """Read-only view of the trading bot's status.json; None when it cannot be read."""
+    try:
+        s = json.loads(Path(path).read_text(encoding="utf-8"))
+        r = s.get("result") or {}
+        alt = (r.get("alt_signal") or {}).get("symbol")
+        held = bool(alt) and float((s.get("wallet") or {}).get(alt[:-3], 0)) > 0
+        return {"equity_btc": float(r["equity_btc"]), "coin_qty": float(s.get("coin_qty") or 0),
+                "alt": alt[:-3] if held else None, "halt": s.get("halt"),
+                "waiting": bool(r.get("coinm_timing_wait")), "age_s": (now_ms - int(s["updated_at_ms"])) / 1000}
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def mood(taker_bs_1h):
+    if taker_bs_1h is None:
+        return "알 수 없음"
+    if taker_bs_1h > 1.10:
+        return "사려는 쪽이 강함"
+    if taker_bs_1h > 1.03:
+        return "사려는 쪽이 조금 우세"
+    if taker_bs_1h < 0.90:
+        return "팔려는 쪽이 강함"
+    if taker_bs_1h < 0.97:
+        return "팔려는 쪽이 조금 우세"
+    return "팽팽함"
+
+
+def _earlier(db, snap, ms):
+    row = db.execute("SELECT payload FROM snapshots WHERE bar_close_ms=?", (snap["bar_close_ms"] - ms,)).fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def simple_report(db, snap, krw_rate=1390.0):
+    """A few plain lines for the hourly Telegram message; details stay in the ledger and CSV."""
+    t = datetime.fromtimestamp(snap["bar_close_ms"] / 1000, KST)
+    lines = [f"[비트코인 봇] {t:%m/%d %H:%M}"]
+    p, price = snap.get("portfolio"), snap["mark"]
+    if p:
+        day = _earlier(db, snap, 86_400_000)
+        change = ""
+        if day and day.get("portfolio"):
+            change = f" · 하루 {_pct(p['equity_btc'] / day['portfolio']['equity_btc'] - 1, 1)}"
+        lines.append(f"💰 내 자산 {p['equity_btc']:.6f} BTC (약 {p['equity_btc'] * price * krw_rate / 10000:.1f}만원){change}")
+    hour = _earlier(db, snap, 3_600_000)
+    one_h = f" · 1시간 {_pct(snap['close'] / hour['close'] - 1, 1)}" if hour else ""
+    lines.append(f"📊 비트코인 {price:,.0f}달러{one_h} · 오늘 {_pct(snap['close'] / snap['daily_open'] - 1, 1)}")
+    if p:
+        if p["halt"]:
+            lines.append(f"⚠️ 봇 멈춤: {p['halt']}")
+        elif p["age_s"] > 300:
+            lines.append("⚠️ 봇 상태가 5분 넘게 갱신되지 않음")
+        else:
+            fut = ("상승에 베팅 중(선물 롱)" if p["coin_qty"] > 0 else "하락에 베팅 중(선물 숏)" if p["coin_qty"] < 0
+                   else "선물 포지션 없음")
+            alt = f" + 알트 {p['alt']} 보유" if p["alt"] else " + 알트 없음(BTC로 대기)"
+            lines.append("🤖 봇: " + fut + alt + (" · 방향 바꿀 타이밍 기다리는 중" if p["waiting"] else ""))
+    lines.append("🌡️ 분위기: " + mood(snap["taker_bs"]["um"].get("12")))
+    lines += llm_judge.simple_lines(db, snap["bar_close_ms"])
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------- service
 
-async def cycle(session, db, model, now_ms):
+async def cycle(session, db, model, now_ms, portfolio_path=None):
     raw = await fetch(session)
     last_open = (now_ms // BAR) * BAR - BAR
     for _ in range(3):                                   # metrics rows can arrive a little late
@@ -513,9 +578,21 @@ async def cycle(session, db, model, now_ms):
         raw.update(await fetch(session, METRIC_KEYS))
     fr = LiveFrame(raw, now_ms)
     snap = snapshot(fr, raw, model, now_ms)
+    snap["portfolio"] = read_portfolio(portfolio_path, now_ms) if portfolio_path else None
     store(db, snap)
     score(db, fr)
-    return snap
+    return snap, fr
+
+
+async def judge(session, db, cfg, snap, fr):
+    """Record Gemini's shadow call for this bar; failures are stored, never raised."""
+    from btc_spot.runtime import safe_error
+    try:
+        decision = await llm_judge.ask(session, cfg, llm_judge.build_prompt(snap, fr.px["close"]))
+        llm_judge.store(db, snap["bar_close_ms"], cfg["model"], decision)
+    except Exception as exc:
+        print(json.dumps({"gemini": safe_error(exc)}), flush=True)
+        llm_judge.store(db, snap["bar_close_ms"], cfg["model"], error=type(exc).__name__)
 
 
 async def run(args):
@@ -530,6 +607,7 @@ async def run(args):
     if args.credentials_file:
         from btc_spot.notify import settings
         config = settings(args.credentials_file)
+    gemini = llm_judge.settings(args.gemini_file) if args.gemini_file else None
     model_mtime = Path(args.model).stat().st_mtime_ns
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
@@ -543,8 +621,10 @@ async def run(args):
                 except Exception as exc:                 # keep the loaded model on a bad file
                     print(json.dumps(safe_error(exc)), flush=True)
                 try:
-                    snap = await cycle(session, db, model, now_ms)
+                    snap, fr = await cycle(session, db, model, now_ms, args.portfolio_status)
                     write_prediction(args.state_dir, snap, model)
+                    if gemini and (llm_judge.due(snap["bar_close_ms"]) or args.once):
+                        await judge(session, db, gemini, snap, fr)
                     status = {"updated_ms": now_ms, "bar_close_ms": snap["bar_close_ms"],
                               "metrics_fresh": snap["metrics_fresh"]}
                     (Path(args.state_dir) / "status.json").write_text(json.dumps(status))
@@ -568,7 +648,7 @@ async def hourly(session, db, model, snap, config, printed):
     hour = snap["bar_close_ms"]
     if db.execute("SELECT 1 FROM reports WHERE hour_ms=?", (hour,)).fetchone():
         return
-    text = report_text(snap, stats_for(db, hour), model.get("backtest_rank_ic_holdout", {}).get("24"))
+    text = simple_report(db, snap, config.fallback_krw if config else 1390.0)
     if config is None:
         if not printed:
             print(text, flush=True)
@@ -618,6 +698,8 @@ def main(argv=None):
         p.add_argument("--state-dir", type=Path, default=DEFAULT_STATE)
         p.add_argument("--model", type=Path, default=MODEL_PATH)
         p.add_argument("--credentials-file", type=Path, help="Telegram settings (.env); omit to print only")
+        p.add_argument("--gemini-file", type=Path, help="GEMINI_API_KEY [+ GEMINI_MODEL] (.env); omit to disable")
+        p.add_argument("--portfolio-status", type=Path, help="trading bot status.json, read only for the report")
     p = sub.add_parser("export")
     p.add_argument("--state-dir", type=Path, default=DEFAULT_STATE)
     p.add_argument("--out", type=Path, required=True)
@@ -632,13 +714,18 @@ def main(argv=None):
         args.once = args.command == "once"
         if args.once:
             args.credentials_file = None
-        asyncio.run(run(args))
+        try:
+            asyncio.run(run(args))
+        except KeyboardInterrupt:                        # systemd stops the service with SIGINT
+            return
         if args.once:
             db = open_db(args.state_dir)
             row = db.execute("SELECT payload FROM snapshots ORDER BY bar_close_ms DESC LIMIT 1").fetchone()
             if row:
                 snap = json.loads(row[0])
-                print(report_text(snap, stats_for(db, snap["bar_close_ms"])))
+                lines = [report_text(snap, stats_for(db, snap["bar_close_ms"])),
+                         *llm_judge.report_lines(db, snap["bar_close_ms"])]
+                print("\n".join(lines))
             db.close()
 
 

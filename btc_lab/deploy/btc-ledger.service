@@ -12,7 +12,7 @@ Group=btcspot
 WorkingDirectory=/opt/btc-spot
 Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 UnsetEnvironment=BINANCE_API_KEY BINANCE_API_SECRET AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
-ExecStart=/opt/btc-ledger/.venv/bin/python -m btc_lab.ledger run --state-dir /var/lib/btc-ledger --model /var/lib/btc-ledger/model/ledger_model.json --credentials-file /etc/btc-spot/ledger-telegram.env
+ExecStart=/opt/btc-ledger/.venv/bin/python -m btc_lab.ledger run --state-dir /var/lib/btc-ledger --model /var/lib/btc-ledger/model/ledger_model.json --credentials-file /etc/btc-spot/ledger-telegram.env --gemini-file /etc/btc-spot/ledger-gemini.env --portfolio-status /var/lib/btc-portfolio/live/status.json
 Restart=on-failure
 RestartSec=30
 KillSignal=SIGINT

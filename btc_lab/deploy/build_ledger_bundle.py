@@ -9,7 +9,7 @@ from pathlib import Path
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
-FILES = ("btc_lab/ledger.py", "btc_lab/regime_switch.py", "btc_lab/strategy_search.py", "btc_lab/retrain.py",
+FILES = ("btc_lab/ledger.py", "btc_lab/llm_judge.py", "btc_lab/regime_switch.py", "btc_lab/strategy_search.py", "btc_lab/retrain.py",
          "btc_lab/flow_data.py", "btc_lab/intraday_data.py",
          "btc_lab/state/ledger_model/ledger_model.json", "btc_lab/deploy/btc-ledger.service",
          "btc_lab/deploy/btc-ledger-retrain.service", "btc_lab/deploy/btc-ledger-retrain.timer",
