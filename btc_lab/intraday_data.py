@@ -39,7 +39,7 @@ SERIES = {
     "BTCUSD_PERP_mark": ("futures/cm/monthly/markPriceKlines/BTCUSD_PERP/5m/BTCUSD_PERP-5m-{m}.zip",
                          "dapi.binance.com", "/dapi/v1/markPriceKlines", "BTCUSD_PERP"),
 }
-ALLOWED = {"data.binance.vision", "api.binance.com", "dapi.binance.com"}
+ALLOWED = {"data.binance.vision", "api.binance.com", "dapi.binance.com", "fapi.binance.com"}
 
 
 def fetch(url, attempts=6):
@@ -58,9 +58,9 @@ def fetch(url, attempts=6):
     raise RuntimeError("Public download failed: " + urlsplit(url).path)
 
 
-def months():
-    year, month = FIRST_MONTH
-    while (year, month) <= LAST_ARCHIVE_MONTH:
+def months(first=FIRST_MONTH, last=LAST_ARCHIVE_MONTH):
+    year, month = first
+    while (year, month) <= last:
         yield f"{year:04d}-{month:02d}"
         year, month = (year + 1, 1) if month == 12 else (year, month + 1)
 
@@ -77,35 +77,38 @@ def parse_archive(raw):
     return rows
 
 
-def rest_rows(host, path, symbol):
-    rows, start = [], REST_START
+def rest_rows(host, path, symbol, start=REST_START, end=REST_END):
+    rows = []
     limit = 1500 if host == "dapi.binance.com" else 1000
-    while start < REST_END:
+    while start < end:
         query = {"symbol": symbol, "interval": "5m", "startTime": start,
-                 "endTime": REST_END - 1, "limit": limit}
+                 "endTime": end - 1, "limit": limit}
         if path == "/dapi/v1/markPriceKlines":
             query.pop("symbol")
             query["symbol"] = symbol
         chunk = json.loads(fetch(f"https://{host}{path}?" + urlencode(query)))
         if not chunk:
             break
-        rows += [r[:6] for r in chunk if int(r[6]) < REST_END]
+        rows += [r[:6] for r in chunk if int(r[6]) < end]
         start = int(chunk[-1][0]) + BAR
     return rows
 
 
-def build(name, output=OUTPUT):
+def build(name, output=OUTPUT, first=FIRST_MONTH, last=LAST_ARCHIVE_MONTH, rest=(REST_START, REST_END)):
+    """rest=None uses monthly archives only (complete months)."""
     template, host, path, symbol = SERIES[name]
+    names = list(months(first, last))
     with ThreadPoolExecutor(6) as pool:
-        archives = list(pool.map(lambda m: fetch("https://data.binance.vision/data/" + template.format(m=m)), months()))
+        archives = list(pool.map(lambda m: fetch("https://data.binance.vision/data/" + template.format(m=m)), names))
     rows = []
     missing = []
-    for month, raw in zip(months(), archives):
+    for month, raw in zip(names, archives):
         if raw is None:
             missing.append(month)
             continue
         rows += parse_archive(raw)
-    rows += rest_rows(host, path, symbol)
+    if rest:
+        rows += rest_rows(host, path, symbol, *rest)
     table = {}
     for r in rows:
         t = int(r[0])
