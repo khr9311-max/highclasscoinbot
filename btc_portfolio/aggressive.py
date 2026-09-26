@@ -7,6 +7,7 @@ from decimal import Decimal
 from math import log, sqrt
 
 from btc_spot.store import number
+from . import timing
 from .signals import closed
 
 D = Decimal
@@ -252,11 +253,19 @@ async def execute(engine, account, markets, fees, equity):
 
     position = account["position"]
     signed = 1 if position.position_amt > 0 else -1 if position.position_amt < 0 else 0
+    coin_wait = None
     if signed and ((coin["direction"] and signed != coin["direction"]) or number(c.spot_fraction) == 1):
-        await reduce(engine, market, signed, abs(position.position_amt),
-                     "aggressive_flip:"+coin["bar"]+":"+str(abs(position.position_amt)))
-        s.event("aggressive_coin_flip", {"from": signed, "to": coin["direction"], "bar": coin["bar"]})
-        return {**result, "action": "coinm_reduce_only_flip"}
+        flip = bool(coin["direction"]) and number(c.spot_fraction) < 1
+        go, timing_info = timing.decide(s, c, coin, -signed, now) if flip else (True, None)
+        if go:
+            await reduce(engine, market, signed, abs(position.position_amt),
+                         "aggressive_flip:"+coin["bar"]+":"+str(abs(position.position_amt)))
+            s.event("aggressive_coin_flip", {"from": signed, "to": coin["direction"], "bar": coin["bar"],
+                                             **({"timing": timing_info} if timing_info else {})})
+            return {**result, "action": "coinm_reduce_only_flip"}
+        coin_wait = timing_info
+    elif coin["direction"] and signed == coin["direction"]:
+        timing.clear(s)
 
     # Calendar-month rebalancing precedes the daily contract resize.
     if date.day == 1 and s.get("aggressive_rebalanced_month") != month_key and not killed:
@@ -275,7 +284,12 @@ async def execute(engine, account, markets, fees, equity):
                 return {**result, "action": outcome}
         s.put("aggressive_rebalanced_month", month_key)
 
-    if number(c.spot_fraction) < 1 and coin["direction"]:
+    if (coin_wait is None and number(c.spot_fraction) < 1 and coin["direction"] and not signed and not killed
+            and s.get("aggressive_blocked_side") != coin["direction"]):
+        go, timing_info = timing.decide(s, c, coin, coin["direction"], now)
+        if not go:
+            coin_wait = timing_info
+    if coin_wait is None and number(c.spot_fraction) < 1 and coin["direction"]:
         if not signed and not killed and s.get("aggressive_blocked_side") != coin["direction"]:
             if s.get("aggressive_blocked_side") is not None:
                 s.put("aggressive_blocked_side", None)
@@ -290,7 +304,8 @@ async def execute(engine, account, markets, fees, equity):
                 if not await validate_actual_position(engine, updated, market):
                     return {**result, "status": "BLOCKED", "action": "reduce_only_emergency_close"}
                 await engine.protect(updated)
-                s.event("aggressive_coin_entry", {"bar": coin["bar"], "plan": plan})
+                s.event("aggressive_coin_entry", {"bar": coin["bar"], "plan": plan,
+                                                  "timing": (s.get("timing_wait") or {})})
                 return {**result, "action": "coinm_entry", "plan": plan}
             result["coinm_skip"] = plan
         elif signed and c.leverage_mode == "vol" and now//DAY != s.get("aggressive_resized_day"):
@@ -322,6 +337,8 @@ async def execute(engine, account, markets, fees, equity):
                         s.event("aggressive_coin_resize", {"from": current, "to": plan["target_contracts"], "day": day})
                         return {**result, "action": "coinm_resize_up", "plan": plan}
 
+    if coin_wait is not None:
+        result["coinm_timing_wait"] = coin_wait
     winner = alt["symbol"]
     if winner and not killed:
         held_value = number(wallet[winner[:-3]])*number(markets["spot"][winner]["bid"])

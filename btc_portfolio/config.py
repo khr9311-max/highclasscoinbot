@@ -33,6 +33,8 @@ class Config:
     stop_fraction: str = "0.12"
     rebalance_mode: str = "alert"
     kill_fraction: str = "0.25"
+    timing_prediction_path: str = ""
+    timing_max_wait_seconds: int = 14400
 
     def __post_init__(self):
         if self.strategy_mode not in {"swing", "intraday", "aggressive"}:
@@ -47,6 +49,11 @@ class Config:
             if not (0 < number(self.vol_ref) < 1 and 0 < number(self.stop_fraction) < 1
                     and 0 < number(self.kill_fraction) < 1):
                 raise ValueError("Invalid aggressive volatility, stop or kill threshold")
+        if self.timing_prediction_path and (self.strategy_mode != "aggressive"
+                                            or not Path(self.timing_prediction_path).is_absolute()):
+            raise ValueError("Execution timing needs aggressive mode and an absolute prediction path")
+        if type(self.timing_max_wait_seconds) is not int or not 0 <= self.timing_max_wait_seconds <= 14400:
+            raise ValueError("Execution timing wait must be 0..14400 seconds")
         if (type(self.intraday_cooldown_seconds) is not int or not 300 <= self.intraday_cooldown_seconds <= 3600
                 or type(self.intraday_max_hold_seconds) is not int or not 1800 <= self.intraday_max_hold_seconds <= 86400):
             raise ValueError("Invalid intraday holding or cooldown interval")
@@ -86,6 +93,8 @@ class Config:
         if self.strategy_mode == "aggressive":
             digest.update((Path(__file__).parent/"aggressive.py").read_text(encoding="utf-8").encode())
             digest.update((Path(__file__).parent/"transfer.py").read_text(encoding="utf-8").encode())
+            if self.timing_prediction_path:
+                digest.update((Path(__file__).parent/"timing.py").read_text(encoding="utf-8").encode())
         for name in ("btc_spot/engine.py", "btc_lab/market_fit.py", "binance_coinm_v1/exchange/binance_gateway.py",
                      "binance_coinm_v1/exchange/rest_client.py", "binance_coinm_v1/exchange/contract.py"):
             digest.update((ROOT/name).read_text(encoding="utf-8").encode())
